@@ -31,73 +31,75 @@ class VendingBot(commands.Bot):
         self.ready_event.set()
         await self.change_presence(activity=discord.Game(name="냥코 KEY 자판기 🐱"))
         await self.restore_vending_machines()
+        # 5분 핑 자동 전송 시작
+        self.loop.create_task(self.ping_loop())
+    
+    async def ping_loop(self):
+        """5분마다 대시보드/자판기 핑 자동 전송"""
+        import requests as _req
+        while True:
+            try:
+                # 대시보드 핑
+                dashboard_url = db.get_setting('dashboard_url', '')
+                if dashboard_url:
+                    try:
+                        resp = _req.get(dashboard_url.rstrip('/') + '/ping', timeout=10)
+                        logger.info(f"[PING] Dashboard: {resp.status_code}")
+                    except Exception as e:
+                        logger.warning(f"[PING] Dashboard error: {e}")
+                
+                # 자판기 새로고침 (재고/상품 상태 최신화)
+                await self.refresh_vending_machines()
+                logger.info("[PING] Vending machines refreshed")
+            except Exception as e:
+                logger.error(f"[PING] Error: {e}")
+            await asyncio.sleep(300)  # 5분
     
     async def on_message(self, message):
-        """DM 후기 수신 시 리뷰 채널에 자동 등록"""
+        """메시지 처리 - 리뷰는 임베드 버튼(모달)으로만 작성"""
         if message.author.bot:
             return
         
-        # DM 메시지만 처리 (봇이 보낸 후기 요청에 대한 답장)
-        if isinstance(message.channel, discord.DMChannel):
-            # 대기 중인 후기 요청 확인
+        # 일반 메시지 처리 (DM 포함 - 일반 채팅은 리뷰로 등록하지 않음)
+        await self.process_commands(message)
+    
+    async def post_review(self, user, order_id, product_name, rating, content):
+        """리뷰를 리뷰 채널에 임베드로 게시"""
+        try:
+            review_channel_id = db.get_setting('review_channel_id', '')
+            if not review_channel_id:
+                return False, "리뷰 채널이 설정되지 않았습니다. 관리자에게 문의해주세요."
+            
             try:
-                # 최근 구매 완료 주문 확인 (마지막 완료 주문 기준)
-                orders = db.get_orders(user_id=str(message.author.id), limit=3)
-                completed_orders = [o for o in orders if o['status'] == 'completed']
-                
-                if not completed_orders:
-                    return
-                
-                # 가장 최근 완료 주문
-                latest_order = completed_orders[0]
-                review_content = message.content.strip()
-                
-                if len(review_content) < 2:
-                    await message.channel.send("❌ 후기가 너무 짧습니다! 조금 더 길게 작성해주세요.")
-                    return
-                
-                # 리뷰 채널로 전송
-                review_channel_id = db.get_setting('review_channel_id', '')
-                if not review_channel_id:
-                    await message.channel.send("❌ 리뷰 채널이 설정되지 않았습니다. 관리자에게 문의해주세요.")
-                    return
-                
                 review_channel = self.get_channel(int(review_channel_id))
                 if not review_channel:
-                    await message.channel.send("❌ 리뷰 채널을 찾을 수 없습니다. 관리자에게 문의해주세요.")
-                    return
-                
-                # 리뷰 임베드 생성
-                embed = discord.Embed(
-                    title="⭐ 구매 후기",
-                    description=review_content,
-                    color=discord.Color.gold()
-                )
-                embed.set_author(name=f"{message.author.display_name}", icon_url=message.author.display_avatar.url)
-                embed.add_field(name="📦 상품", value=latest_order['product_name'], inline=True)
-                embed.add_field(name="주문번호", value=f"#{latest_order['id']}", inline=True)
-                embed.set_footer(text="냥코 KEY 자판기 🐱 | 구매 후기")
-                
-                await review_channel.send(embed=embed)
-                
-                # 확인 DM
-                confirm_embed = discord.Embed(
-                    title="✅ 후기가 등록되었습니다!",
-                    description="소중한 후기 감사합니다! 😊",
-                    color=discord.Color.green()
-                )
-                confirm_embed.set_footer(text="냥코 KEY 자판기 🐱")
-                await message.channel.send(embed=confirm_embed)
-                
-                logger.info(f"Review registered from {message.author} for order #{latest_order['id']}")
-                
-            except Exception as e:
-                logger.error(f"Review DM error: {e}")
-                await message.channel.send("❌ 후기 등록 중 오류가 발생했습니다. 관리자에게 문의해주세요.")
-            return
-        
-        # 일반 메시지 처리
-        await self.process_commands(message)
+                    review_channel = await self.fetch_channel(int(review_channel_id))
+            except discord.NotFound:
+                return False, f"리뷰 채널(ID: {review_channel_id})을 찾을 수 없습니다. 관리자에게 문의해주세요."
+            
+            if not review_channel:
+                return False, "리뷰 채널을 찾을 수 없습니다. 관리자에게 문의해주세요."
+            
+            stars = '⭐' * int(rating) + '☆' * (5 - int(rating))
+            
+            embed = discord.Embed(
+                title="⭐ 구매 후기",
+                description=content,
+                color=discord.Color.gold()
+            )
+            embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+            embed.add_field(name="⭐ 별점", value=stars, inline=True)
+            embed.add_field(name="📦 상품", value=product_name, inline=True)
+            embed.add_field(name="🧾 주문번호", value=f"#{order_id}", inline=True)
+            embed.set_footer(text="냥코 KEY 자판기 🐱 | 구매 후기")
+            
+            await review_channel.send(embed=embed)
+            
+            logger.info(f"Review registered from {user} for order #{order_id} ({rating} stars)")
+            return True, "후기가 등록되었습니다!"
+        except Exception as e:
+            logger.error(f"Post review error: {e}")
+            return False, f"후기 등록 실패: {str(e)}"
     
     async def restore_vending_machines(self):
         channels = db.get_vending_channels()
@@ -124,22 +126,58 @@ class VendingBot(commands.Bot):
         except:
             embed_color = discord.Color.blue()
         
-        product_title = db.get_setting('vending_product_title', '🏪 현재 상품')
+        product_title = db.get_setting('vending_product_title', '🏪 판매 중인 상품')
         
+        from datetime import datetime as _dt
         embed = discord.Embed(
             title=title,
             description=desc,
-            color=embed_color
+            color=embed_color,
+            timestamp=_dt.now()
         )
         
+        # 상품 목록 (재고 상태 아이콘 포함, 카테고리 지원)
         products = db.get_products(active_only=True)
+        use_categories = db.get_setting('use_categories', 'false').lower() == 'true'
+        
+        def _stock_line(p):
+            stock = db.count_available_keys(p['id'])
+            icon = '🟢' if stock > 0 else '🔴'
+            return f"{icon} {p['name']} — **{p['price']:,}원**"
+        
+        if use_categories:
+            categories = db.get_categories()
+            if categories:
+                for cat in categories[:4]:
+                    cat_products = db.get_products_by_category(cat, active_only=True)
+                    if not cat_products:
+                        continue
+                    embed.add_field(name=f"📂 {cat}", value="\n".join([_stock_line(p) for p in cat_products[:6]]), inline=True)
+                no_cat = [p for p in products if not p.get('category')]
+                if no_cat:
+                    embed.add_field(name="📦 기타", value="\n".join([_stock_line(p) for p in no_cat[:6]]), inline=True)
+            else:
+                embed.add_field(name=product_title, value="\n".join([_stock_line(p) for p in products[:10]]) or "상품 준비중", inline=False)
+        else:
+            embed.add_field(name=product_title, value="\n".join([_stock_line(p) for p in products[:10]]) or "상품 준비중", inline=False)
+        
+        # 이용 안내 + 실시간 현황
+        total_stock = sum(db.count_available_keys(p['id']) for p in products)
         embed.add_field(
-            name=product_title,
-            value="\n".join([f"• {p['name']} - **{p['price']:,}원**" for p in products[:5]]) or "상품 준비중",
+            name="📊 이용 안내",
+            value="**🛒 구매** → KEY 즉시 구매 (DM 발송)\n**💰 충전** → 입금 후 포인트 자동 충전\n**🎫 문의** → 1:1 문의 티켓",
+            inline=False
+        )
+        embed.add_field(
+            name="📈 실시간 현황",
+            value=f"📦 등록 상품: **{len(products)}개** | 🔑 총 재고: **{total_stock}개**",
             inline=False
         )
         
-        embed.set_footer(text=footer)
+        try:
+            embed.set_footer(text=footer, icon_url=self.user.display_avatar.url)
+        except:
+            embed.set_footer(text=footer)
         
         view = VendingMainView()
         
@@ -176,22 +214,23 @@ class VendingBot(commands.Bot):
             return False
     
     async def request_review_dm(self, user_id, order_id, product_name):
-        """구매 후 후기 요청 DM 전송"""
+        """구매 후 후기 요청 DM 전송 (임베드 + 후기 작성 버튼)"""
         try:
             user = await self.fetch_user(int(user_id))
             
             embed = discord.Embed(
-                title="⭐ 후기를 남겨주세요!",
-                description=f"**{product_name}** 구매가 완료되었습니다!\n\n"
-                           f"만족하셨다면 후기를 남겨주세요!\n"
-                           f"후기는 자동으로 리뷰 채널에 등록됩니다.",
+                title="⭐ 구매 완료 & 후기 요청",
+                description=f"**{product_name}** 구매가 완료되었습니다! 🎉\n\n"
+                           f"만족하셨다면 아래 **[✍️ 후기 작성]** 버튼을 눌러\n"
+                           f"별점과 함께 후기를 남겨주세요!",
                 color=discord.Color.gold()
             )
-            embed.add_field(name="주문번호", value=f"#{order_id}", inline=True)
-            embed.add_field(name="작성 방법", value="이 DM에 후기 내용을 **그대로 답장**해주세요!\n예: `너무 좋아요! 빠른 전송 감사합니다~`", inline=False)
-            embed.set_footer(text="냥코 KEY 자판기 🐱 | 후기 남기기")
+            embed.add_field(name="🧾 주문번호", value=f"#{order_id}", inline=True)
+            embed.add_field(name="📦 상품", value=product_name, inline=True)
+            embed.set_footer(text="냥코 KEY 자판기 🐱 | 후기는 리뷰 채널에 자동 등록됩니다")
             
-            await user.send(embed=embed)
+            view = ReviewRequestView(order_id, product_name)
+            await user.send(embed=embed, view=view)
             return True
         except Exception as e:
             logger.error(f"Review request DM error: {e}")
@@ -306,14 +345,21 @@ class VendingBot(commands.Bot):
         except Exception as e:
             logger.error(f"Stock notice error: {e}")
     
-    async def send_notice(self, title, content, color_hex=None):
-        """공지 임베드 전송 (대시보드 및 봇 명령에서 사용)"""
+    async def send_notice(self, title, content, color_hex=None, image_file=None):
+        """공지 임베드 전송 (대시보드 및 봇 명령에서 사용) - 이미지 파일 지원"""
         notice_channel_id = db.get_setting('notice_channel_id', '')
         if not notice_channel_id:
-            return False, "공지 채널이 설정되지 않았습니다."
+            return False, "공지 채널이 설정되지 않았습니다. 대시보드 설정에서 공지 채널 ID를 입력하고 저장해주세요."
         
         try:
-            channel = self.get_channel(int(notice_channel_id))
+            # fetch_channel 사용: 캐시에 없어도 API로 직접 조회
+            try:
+                channel = self.get_channel(int(notice_channel_id))
+                if not channel:
+                    channel = await self.fetch_channel(int(notice_channel_id))
+            except discord.NotFound:
+                return False, f"공지 채널(ID: {notice_channel_id})을 찾을 수 없습니다. 채널 ID가 올바른지 확인해주세요."
+            
             if not channel:
                 return False, "공지 채널을 찾을 수 없습니다."
             
@@ -330,7 +376,15 @@ class VendingBot(commands.Bot):
                 color=embed_color
             )
             embed.set_footer(text="냥코 KEY 자판기 🐱 | 공지")
-            await channel.send(embed=embed)
+            
+            # 이미지 파일이 있으면 첨부
+            if image_file:
+                file = discord.File(image_file, filename="notice_image.png")
+                embed.set_image(url="attachment://notice_image.png")
+                await channel.send(embed=embed, file=file)
+            else:
+                await channel.send(embed=embed)
+            
             return True, "공지가 전송되었습니다!"
         except Exception as e:
             logger.error(f"Send notice error: {e}")
@@ -712,6 +766,87 @@ class CloseTicketButton(discord.ui.Button):
             await interaction.channel.delete()
         except:
             pass
+
+
+class ReviewRequestView(discord.ui.View):
+    """후기 작성 버튼 뷰 (DM용)"""
+    def __init__(self, order_id, product_name):
+        super().__init__(timeout=None)
+        self.order_id = order_id
+        self.product_name = product_name
+        self.add_item(ReviewButton(order_id, product_name))
+
+
+class ReviewButton(discord.ui.Button):
+    def __init__(self, order_id, product_name):
+        super().__init__(
+            label="✍️ 후기 작성",
+            style=discord.ButtonStyle.success,
+            custom_id=f"review_write_{order_id}",
+            emoji=None
+        )
+        self.order_id = order_id
+        self.product_name = product_name
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(ReviewModal(self.order_id, self.product_name))
+
+
+class ReviewModal(discord.ui.Modal):
+    """후기 작성 모달 (별점 + 내용)"""
+    def __init__(self, order_id, product_name):
+        super().__init__(title=f"⭐ 후기 작성 - {product_name[:20]}")
+        self.order_id = order_id
+        self.product_name = product_name
+        
+        self.rating = discord.ui.TextInput(
+            label="별점 (1~5)",
+            placeholder="1부터 5까지 숫자로 입력하세요 (예: 5)",
+            required=True,
+            max_length=1
+        )
+        self.add_item(self.rating)
+        
+        self.content = discord.ui.TextInput(
+            label="후기 내용",
+            style=discord.TextStyle.paragraph,
+            placeholder="상품에 대한 솔직한 후기를 남겨주세요!",
+            required=True,
+            max_length=1000
+        )
+        self.add_item(self.content)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            rating = int(self.rating.value.strip())
+        except:
+            await interaction.response.send_message("❌ 별점은 1~5 사이의 숫자로 입력해주세요.", ephemeral=True)
+            return
+        
+        if rating < 1 or rating > 5:
+            await interaction.response.send_message("❌ 별점은 1~5 사이의 숫자로 입력해주세요.", ephemeral=True)
+            return
+        
+        content = self.content.value.strip()
+        if len(content) < 2:
+            await interaction.response.send_message("❌ 후기가 너무 짧습니다! 조금 더 길게 작성해주세요.", ephemeral=True)
+            return
+        
+        # 리뷰 채널에 게시
+        success, msg = await interaction.client.post_review(
+            interaction.user, self.order_id, self.product_name, rating, content
+        )
+        
+        if success:
+            confirm_embed = discord.Embed(
+                title="✅ 후기가 등록되었습니다!",
+                description="소중한 후기 감사합니다! 😊\n\n후기는 리뷰 채널에 등록되었습니다.",
+                color=discord.Color.green()
+            )
+            confirm_embed.set_footer(text="냥코 KEY 자판기 🐱")
+            await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
 
 
 class ChargeRequestView(discord.ui.View):

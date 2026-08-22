@@ -50,20 +50,20 @@ def _validate_session_token(token):
 bot = VendingBot()
 pushbullet_monitor = PushbulletMonitor()
 
-# ============ PING KEEPER (24h) ============
+# ============ PING KEEPER (5분마다) ============
 def ping_keeper():
-    """Send ping every 24 hours to keep the service alive on Render"""
+    """5분마다 대시보드 핑 전송 (서버 유지 + 상태 갱신)"""
     while True:
         try:
             dashboard_url = db.get_setting('dashboard_url', '')
             if dashboard_url:
-                resp = requests.get(dashboard_url + '/ping', timeout=10)
-                logger.info(f"Ping sent to {dashboard_url}: {resp.status_code}")
+                resp = requests.get(dashboard_url.rstrip('/') + '/ping', timeout=10)
+                logger.info(f"[PING] Dashboard: {resp.status_code}")
             else:
-                logger.info("Dashboard URL not set, skipping ping")
+                logger.debug("Dashboard URL not set, skipping ping")
         except Exception as e:
-            logger.error(f"Ping error: {e}")
-        time.sleep(24 * 60 * 60)  # 24 hours
+            logger.warning(f"[PING] Dashboard error: {e}")
+        time.sleep(300)  # 5분
 
 # ============ DEPOSIT HANDLER ============
 def handle_deposit(amount, text, depositor=None):
@@ -298,11 +298,28 @@ def dashboard():
 @app.route('/api/notice/send', methods=['POST'])
 @login_required
 def api_send_notice():
-    """공지 채널에 임베드 공지 전송"""
-    data = request.json
-    title = data.get('title', '').strip()
-    content = data.get('content', '').strip()
-    color = data.get('color', '')
+    """공지 채널에 임베드 공지 전송 (이미지 파일 지원)"""
+    # JSON 또는 multipart/form-data 모두 지원
+    if request.is_json:
+        data = request.json
+        title = data.get('title', '').strip()
+        content = data.get('content', '').strip()
+        color = data.get('color', '')
+        image_file = None
+    else:
+        title = request.form.get('title', '').strip()
+        content = request.form.get('content', '').strip()
+        color = request.form.get('color', '').strip()
+        image_file = None
+        temp_path = None
+        if 'image' in request.files:
+            f = request.files['image']
+            if f and f.filename:
+                import tempfile
+                ext = os.path.splitext(f.filename)[1] or '.png'
+                fd, temp_path = tempfile.mkstemp(suffix=ext)
+                f.save(temp_path)
+                image_file = temp_path
     
     if not title or not content:
         return jsonify({'error': '제목과 내용을 입력해주세요.'}), 400
@@ -310,11 +327,24 @@ def api_send_notice():
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        success, msg = loop.run_until_complete(bot.send_notice(title, content, color))
+        success, msg = loop.run_until_complete(bot.send_notice(title, content, color, image_file))
         loop.close()
+        
+        # 임시 파일 삭제
+        if not request.is_json and temp_path:
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        
         return jsonify({'success': success, 'message': msg})
     except Exception as e:
         logger.error(f"Send notice error: {e}")
+        if not request.is_json and temp_path:
+            try:
+                os.remove(temp_path)
+            except:
+                pass
         return jsonify({'success': False, 'message': str(e)}), 500
 
 # --- Products ---

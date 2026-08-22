@@ -18,10 +18,32 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
 });
 
 // ============ NOTICE (공지 보내기) ============
+// 이미지 미리보기
+document.addEventListener('DOMContentLoaded', function() {
+    const imageInput = document.getElementById('notice-image');
+    if (imageInput) {
+        imageInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            const preview = document.getElementById('notice-image-preview');
+            if (file && preview) {
+                const reader = new FileReader();
+                reader.onload = function(ev) {
+                    preview.src = ev.target.result;
+                    preview.style.display = 'block';
+                };
+                reader.readAsDataURL(file);
+            } else if (preview) {
+                preview.style.display = 'none';
+            }
+        });
+    }
+});
+
 async function sendNotice() {
     const title = document.getElementById('notice-title').value.trim();
     const content = document.getElementById('notice-content').value.trim();
     const color = document.getElementById('notice-color').value.trim();
+    const imageInput = document.getElementById('notice-image');
     const resultDiv = document.getElementById('notice-result');
     
     if (!title || !content) {
@@ -31,16 +53,27 @@ async function sendNotice() {
     
     resultDiv.innerHTML = '<p style="color:#888;">전송 중...</p>';
     try {
+        // FormData로 전송 (이미지 파일 지원)
+        const formData = new FormData();
+        formData.append('title', title);
+        formData.append('content', content);
+        formData.append('color', color);
+        if (imageInput && imageInput.files[0]) {
+            formData.append('image', imageInput.files[0]);
+        }
+        
         const resp = await fetch('/api/notice/send', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ title: title, content: content, color: color })
+            body: formData
         });
         const data = await resp.json();
         if (data.success) {
             resultDiv.innerHTML = '<p style="color:#2ecc71;font-weight:600;">✅ ' + data.message + '</p>';
             document.getElementById('notice-title').value = '';
             document.getElementById('notice-content').value = '';
+            if (imageInput) imageInput.value = '';
+            const preview = document.getElementById('notice-image-preview');
+            if (preview) preview.style.display = 'none';
         } else {
             resultDiv.innerHTML = '<p style="color:#e74c3c;font-weight:600;">❌ ' + (data.message || data.error || '전송 실패') + '</p>';
         }
