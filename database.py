@@ -113,6 +113,17 @@ def init_db():
         closed_at TEXT DEFAULT NULL
     )''')
     
+    # Coupons table (할인 쿠폰/이벤트)
+    c.execute('''CREATE TABLE IF NOT EXISTS coupons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        discount_amount INTEGER NOT NULL,
+        max_uses INTEGER DEFAULT 0,  -- 0 = 무제한
+        used_count INTEGER DEFAULT 0,
+        active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
     conn.commit()
     conn.close()
 
@@ -648,5 +659,81 @@ def close_ticket(tid):
     conn = get_conn()
     c = conn.cursor()
     c.execute('UPDATE tickets SET status=?, closed_at=CURRENT_TIMESTAMP WHERE id=?', ('closed', tid))
+    conn.commit()
+    conn.close()
+
+# ============ COUPONS (할인 쿠폰) ============
+def create_coupon(code, discount_amount, max_uses=0):
+    """쿠폰 생성 - 코드 중복 시 -1 반환"""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO coupons (code, discount_amount, max_uses) VALUES (?, ?, ?)',
+                  (code.strip().upper(), int(discount_amount), int(max_uses)))
+        conn.commit()
+        cid = c.lastrowid
+    except sqlite3.IntegrityError:
+        cid = -1  # 중복 코드
+    conn.close()
+    return cid
+
+def get_coupons(active_only=False):
+    """쿠폰 목록 조회"""
+    conn = get_conn()
+    c = conn.cursor()
+    if active_only:
+        c.execute('SELECT * FROM coupons WHERE active=1 ORDER BY id DESC')
+    else:
+        c.execute('SELECT * FROM coupons ORDER BY id DESC')
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_coupon(cid):
+    """쿠폰 단건 조회"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM coupons WHERE id=?', (cid,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_coupon_by_code(code):
+    """코드로 쿠폰 조회 (유효성 검사 포함: 활성화 + 사용횟수)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM coupons WHERE code=?', (str(code).strip().upper(),))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    coupon = dict(row)
+    if not coupon['active']:
+        return None
+    if coupon['max_uses'] > 0 and coupon['used_count'] >= coupon['max_uses']:
+        return None
+    return coupon
+
+def use_coupon(cid):
+    """쿠폰 사용 처리 (사용 횟수 +1)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE coupons SET used_count=used_count+1 WHERE id=?', (cid,))
+    conn.commit()
+    conn.close()
+
+def delete_coupon(cid):
+    """쿠폰 삭제"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('DELETE FROM coupons WHERE id=?', (cid,))
+    conn.commit()
+    conn.close()
+
+def toggle_coupon(cid):
+    """쿠폰 활성화/비활성화 토글"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE coupons SET active = CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?', (cid,))
     conn.commit()
     conn.close()

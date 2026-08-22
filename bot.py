@@ -363,7 +363,7 @@ class VendingMainView(ui.LayoutView):
             ui.TextDisplay(f"## {title}"),
             ui.TextDisplay(desc),
             ui.TextDisplay("### 📂 카테고리 / 상품 선택"),
-            CategorySelect(),
+            ui.ActionRow(CategorySelect()),
             ui.ActionRow(
                 VendingButton(label="제품", emoji="🎁", style=discord.ButtonStyle.primary, custom_id="vending_products"),
                 VendingButton(label="충전", emoji="💰", style=discord.ButtonStyle.success, custom_id="vending_charge"),
@@ -487,7 +487,9 @@ class CategorySelect(discord.ui.Select):
                 return
             
             await interaction.response.send_message(
-                f"✅ **{product['name']}** - {product['price']:,}포인트\n\n구매를 진행하시겠습니까?",
+                f"✅ **{product['name']}** - {product['price']:,}포인트\n\n"
+                f"구매를 진행하시겠습니까?\n"
+                f"🎟️ 쿠폰이 있다면 **쿠폰 사용** 버튼을 눌러 할인받으세요! (없으면 바로 구매 확정)",
                 view=ConfirmBuyView(product),
                 ephemeral=True
             )
@@ -1032,23 +1034,27 @@ class BuyButton(discord.ui.Button):
         
         # Confirm purchase
         await interaction.response.send_message(
-            f"✅ **{self.product['name']}** - {self.product['price']:,}포인트\n\n구매를 진행하시겠습니까?",
+            f"✅ **{self.product['name']}** - {self.product['price']:,}포인트\n\n"
+            f"구매를 진행하시겠습니까?\n"
+            f"🎟️ 쿠폰이 있다면 **쿠폰 사용** 버튼을 눌러 할인받으세요! (없으면 바로 구매 확정)",
             view=ConfirmBuyView(self.product),
             ephemeral=True
         )
 
 
 class ConfirmBuyView(discord.ui.View):
-    """Confirm purchase view"""
-    def __init__(self, product):
-        super().__init__(timeout=30)
+    """Confirm purchase view (쿠폰 할인 지원)"""
+    def __init__(self, product, coupon=None):
+        super().__init__(timeout=60)
         self.product = product
-        self.add_item(ConfirmBuyButton(product, confirm=True, row=0))
+        self.coupon = coupon
+        self.add_item(ConfirmBuyButton(product, confirm=True, row=0, coupon=coupon))
+        self.add_item(CouponApplyButton(product, row=0))
         self.add_item(ConfirmBuyButton(product, confirm=False, row=0))
 
 
 class ConfirmBuyButton(discord.ui.Button):
-    def __init__(self, product, confirm=True, row=0):
+    def __init__(self, product, confirm=True, row=0, coupon=None):
         if confirm:
             super().__init__(
                 label="✅ 구매 확정",
@@ -1065,17 +1071,26 @@ class ConfirmBuyButton(discord.ui.Button):
             )
         self.product = product
         self.is_confirm = confirm
+        self.coupon = coupon
+    
+    def get_final_price(self):
+        """쿠폰 할인이 적용된 최종 가격"""
+        price = self.product['price']
+        if self.coupon:
+            price = max(0, price - self.coupon['discount_amount'])
+        return price
     
     async def callback(self, interaction: discord.Interaction):
         if not self.is_confirm:
             await interaction.response.edit_message(content="❌ 구매가 취소되었습니다.", embed=None, view=None)
             return
         
-        # Double check balance and stock
+        # Double check balance and stock (쿠폰 할인 적용 가격 기준)
+        final_price = self.get_final_price()
         balance = db.get_balance(str(interaction.user.id))
-        if balance < self.product['price']:
+        if balance < final_price:
             await interaction.response.edit_message(
-                content=f"❌ 포인트가 부족합니다! (부족액: {self.product['price'] - balance:,}포인트)",
+                content=f"❌ 포인트가 부족합니다! (부족액: {final_price - balance:,}포인트)",
                 embed=None, view=None
             )
             return
@@ -1085,12 +1100,13 @@ class ConfirmBuyButton(discord.ui.Button):
             await interaction.response.edit_message(content="❌ 재고가 소진되었습니다.", embed=None, view=None)
             return
         
-        # Deduct balance
+        # Deduct balance (쿠폰 할인 적용)
+        coupon_desc = f" (쿠폰 {self.coupon['code']} -{self.coupon['discount_amount']:,})" if self.coupon else ""
         success = db.deduct_balance(
             str(interaction.user.id),
-            self.product['price'],
+            final_price,
             trans_type='purchase',
-            description=f"{self.product['name']} 구매"
+            description=f"{self.product['name']} 구매{coupon_desc}"
         )
         
         if not success:
@@ -1103,14 +1119,14 @@ class ConfirmBuyButton(discord.ui.Button):
             interaction.user.name,
             self.product['id'],
             self.product['name'],
-            self.product['price']
+            final_price
         )
         
         # Get key and complete
         key = db.get_available_key(self.product['id'])
         if not key:
             # Refund
-            db.add_balance(str(interaction.user.id), interaction.user.name, self.product['price'], 'refund', '재고 소진 환불')
+            db.add_balance(str(interaction.user.id), interaction.user.name, final_price, 'refund', '재고 소진 환불')
             db.update_order_status(order_id, 'cancelled')
             await interaction.response.edit_message(content="❌ 재고가 소진되어 환불되었습니다.", embed=None, view=None)
             return
@@ -1122,6 +1138,10 @@ class ConfirmBuyButton(discord.ui.Button):
         conn.close()
         
         db.update_order_status(order_id, 'completed', key_id=key['id'])
+        
+        # 쿠폰 사용 처리 (사용 횟수 +1)
+        if self.coupon:
+            db.use_coupon(self.coupon['id'])
         
         # Send key via DM (customizable message)
         dm_title = db.get_setting('purchase_dm_title', '✅ 구매 완료!')
@@ -1135,7 +1155,10 @@ class ConfirmBuyButton(discord.ui.Button):
         )
         embed.add_field(name="주문번호", value=f"#{order_id}", inline=True)
         embed.add_field(name="상품", value=self.product['name'], inline=True)
-        embed.add_field(name="결제금액", value=f"{self.product['price']:,}포인트", inline=True)
+        if self.coupon:
+            embed.add_field(name="원래 가격", value=f"{self.product['price']:,}포인트", inline=True)
+            embed.add_field(name=f"🎟️ 할인 ({self.coupon['code']})", value=f"-{self.coupon['discount_amount']:,}포인트", inline=True)
+        embed.add_field(name="결제금액", value=f"{final_price:,}포인트", inline=True)
         embed.add_field(name="🔑 KEY", value=f"```{key['key_value']}```", inline=False)
         embed.set_footer(text=dm_footer)
         
@@ -1143,10 +1166,11 @@ class ConfirmBuyButton(discord.ui.Button):
         
         new_balance = db.get_balance(str(interaction.user.id))
         
+        discount_text = f"\n🎟️ 쿠폰 할인: -{self.coupon['discount_amount']:,}포인트 ({self.coupon['code']})" if self.coupon else ""
         await interaction.response.edit_message(
             content=f"✅ **구매 완료!**\n\n"
                    f"📦 상품: {self.product['name']}\n"
-                   f"💰 사용 포인트: {self.product['price']:,}포인트\n"
+                   f"💰 사용 포인트: {final_price:,}포인트{discount_text}\n"
                    f"💳 남은 포인트: {new_balance:,}포인트\n"
                    f"🔑 KEY가 DM으로 전송되었습니다!",
             embed=None, view=None
@@ -1168,7 +1192,9 @@ class ConfirmBuyButton(discord.ui.Button):
                     embed_log.add_field(name="주문번호", value=f"#{order_id}", inline=True)
                     embed_log.add_field(name="구매자", value=f"{interaction.user.mention} ({interaction.user.name})", inline=True)
                     embed_log.add_field(name="상품", value=self.product['name'], inline=True)
-                    embed_log.add_field(name="결제 금액", value=f"{self.product['price']:,}포인트", inline=True)
+                    if self.coupon:
+                        embed_log.add_field(name="쿠폰 할인", value=f"{self.coupon['code']} (-{self.coupon['discount_amount']:,})", inline=True)
+                    embed_log.add_field(name="결제 금액", value=f"{final_price:,}포인트", inline=True)
                     embed_log.add_field(name="구매 시간", value=datetime.now().strftime('%Y-%m-%d %H:%M:%S'), inline=True)
                     embed_log.set_footer(text="🔑 키는 관리자 패널에서 확인하세요")
                     await channel.send(embed=embed_log)
@@ -1190,6 +1216,62 @@ class ConfirmBuyButton(discord.ui.Button):
         
         # Refresh vending machine stock
         await interaction.client.refresh_vending_machines()
+
+
+class CouponApplyButton(discord.ui.Button):
+    """구매 확인창에서 쿠폰 코드 입력 버튼"""
+    def __init__(self, product, row=0):
+        super().__init__(
+            label="쿠폰 사용",
+            emoji="🎟️",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"coupon_apply_{product['id']}",
+            row=row
+        )
+        self.product = product
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CouponModal(self.product))
+
+
+class CouponModal(discord.ui.Modal):
+    """쿠폰 코드 입력 모달 - 유효한 쿠폰이면 할인 적용된 구매창으로 갱신"""
+    def __init__(self, product):
+        super().__init__(title="🎟️ 할인 쿠폰 입력")
+        self.product = product
+        
+        self.code = discord.ui.TextInput(
+            label="쿠폰 코드",
+            placeholder="쿠폰 코드를 입력하세요 (예: WELCOME1000)",
+            required=True,
+            max_length=50
+        )
+        self.add_item(self.code)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        code = self.code.value.strip()
+        coupon = db.get_coupon_by_code(code)
+        
+        if not coupon:
+            await interaction.response.send_message(
+                "❌ 유효하지 않은 쿠폰 코드입니다.\n"
+                "(존재하지 않거나, 비활성화되었거나, 사용 횟수가 모두 소진된 쿠폰입니다.)",
+                ephemeral=True
+            )
+            return
+        
+        discount = coupon['discount_amount']
+        final_price = max(0, self.product['price'] - discount)
+        
+        content = (
+            f"✅ **{self.product['name']}**\n\n"
+            f"💰 원래 가격: ~~{self.product['price']:,}포인트~~\n"
+            f"🎟️ 쿠폰 할인: **-{discount:,}포인트** ({coupon['code']})\n"
+            f"💳 결제 금액: **{final_price:,}포인트**\n\n"
+            f"구매를 진행하시겠습니까?"
+        )
+        
+        await interaction.response.edit_message(content=content, view=ConfirmBuyView(self.product, coupon))
 
 
 class VendingCommands(commands.Cog):
@@ -1433,6 +1515,90 @@ class VendingCommands(commands.Cog):
         await interaction.response.send_message(
             f"✅ 카테고리 기능이 **{status}**되었습니다!", ephemeral=True)
         await self.bot.refresh_vending_machines()
+    
+    # ============ COUPON COMMANDS (할인 쿠폰) ============
+    
+    @app_commands.command(name="쿠폰생성", description="[관리자] 할인 쿠폰을 생성합니다")
+    @app_commands.describe(code="쿠폰 코드 (예: WELCOME1000)", discount_amount="할인 금액(포인트)", max_uses="최대 사용 횟수 (0=무제한)")
+    async def create_coupon_cmd(self, interaction: discord.Interaction, code: str, discount_amount: int, max_uses: int = 0):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        
+        if discount_amount <= 0:
+            await interaction.response.send_message("❌ 할인 금액은 0보다 커야 합니다.", ephemeral=True)
+            return
+        if max_uses < 0:
+            await interaction.response.send_message("❌ 최대 사용 횟수는 0 이상이어야 합니다.", ephemeral=True)
+            return
+        
+        cid = db.create_coupon(code, discount_amount, max_uses)
+        if cid == -1:
+            await interaction.response.send_message(
+                f"❌ 이미 존재하는 쿠폰 코드입니다: **{code.strip().upper()}**",
+                ephemeral=True
+            )
+            return
+        
+        uses_text = f"{max_uses}회" if max_uses > 0 else "무제한"
+        await interaction.response.send_message(
+            f"✅ 쿠폰이 생성되었습니다!\n\n"
+            f"🎟️ 코드: **{code.strip().upper()}**\n"
+            f"💰 할인: **{discount_amount:,}포인트**\n"
+            f"🔢 사용 가능: **{uses_text}**",
+            ephemeral=True
+        )
+    
+    @app_commands.command(name="쿠폰목록", description="[관리자] 등록된 쿠폰 목록을 확인합니다")
+    async def coupon_list_cmd(self, interaction: discord.Interaction):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        
+        coupons = db.get_coupons()
+        if not coupons:
+            await interaction.response.send_message("✅ 등록된 쿠폰이 없습니다.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"🎟️ 할인 쿠폰 목록 ({len(coupons)}개)",
+            color=discord.Color.gold()
+        )
+        for cp in coupons[:15]:
+            status = "🟢 활성" if cp['active'] else "🔴 비활성"
+            uses_text = f"{cp['used_count']}/{cp['max_uses']}" if cp['max_uses'] > 0 else f"{cp['used_count']}/무제한"
+            embed.add_field(
+                name=f"{cp['code']} (-{cp['discount_amount']:,}포인트)",
+                value=f"{status} | 사용: {uses_text}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    @app_commands.command(name="쿠폰삭제", description="[관리자] 쿠폰을 삭제합니다")
+    @app_commands.describe(code="삭제할 쿠폰 코드")
+    async def coupon_delete_cmd(self, interaction: discord.Interaction, code: str):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+        
+        conn = db.get_conn()
+        c = conn.cursor()
+        c.execute('SELECT * FROM coupons WHERE code=?', (code.strip().upper(),))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            await interaction.response.send_message(
+                f"❌ 존재하지 않는 쿠폰 코드입니다: **{code.strip().upper()}**",
+                ephemeral=True
+            )
+            return
+        
+        db.delete_coupon(row['id'])
+        await interaction.response.send_message(
+            f"✅ 쿠폰이 삭제되었습니다: **{code.strip().upper()}**",
+            ephemeral=True
+        )
     
     @app_commands.command(name="공지", description="[관리자] 공지 채널에 임베드 공지를 보냅니다")
     @app_commands.describe(title="공지 제목", content="공지 내용")

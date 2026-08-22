@@ -400,14 +400,13 @@ def api_add_keys(pid):
         return jsonify({'error': '키를 입력해주세요.'}), 400
     db.add_keys(pid, key_list)
     
-    # 입고 채널에 공지 전송 (봇이 실행 중일 때만)
+    # 입고 채널에 공지 전송 + 자판기 새로고침 (봇이 실행 중일 때만)
     product = db.get_product(pid)
     if product and bot.is_ready():
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(bot.send_stock_notice(product, len(key_list)))
-            loop.close()
+            # 봇의 이벤트 루프에서 안전하게 실행 (스레드 간 호출)
+            asyncio.run_coroutine_threadsafe(bot.send_stock_notice(product, len(key_list)), bot.loop)
+            asyncio.run_coroutine_threadsafe(bot.refresh_vending_machines(), bot.loop)
         except Exception as e:
             logger.error(f"Stock notice error: {e}")
     
@@ -542,6 +541,48 @@ def api_deduct_points(user_id):
         return jsonify({'error': '잔액 부족'}), 400
     new_balance = db.get_balance(user_id)
     return jsonify({'success': True, 'balance': new_balance})
+
+# --- Coupons (쿠폰/할인 이벤트) ---
+@app.route('/api/coupons', methods=['GET'])
+@login_required
+def api_get_coupons():
+    return jsonify(db.get_coupons())
+
+@app.route('/api/coupons', methods=['POST'])
+@login_required
+def api_create_coupon():
+    data = request.json
+    code = data.get('code', '').strip()
+    discount_amount = data.get('discount_amount', 0)
+    max_uses = data.get('max_uses', 0)
+    if not code:
+        return jsonify({'error': '쿠폰 코드를 입력해주세요.'}), 400
+    try:
+        discount_amount = int(discount_amount)
+        max_uses = int(max_uses)
+    except (TypeError, ValueError):
+        return jsonify({'error': '할인 금액과 사용 횟수는 숫자로 입력해주세요.'}), 400
+    if discount_amount <= 0:
+        return jsonify({'error': '할인 금액은 0보다 커야 합니다.'}), 400
+    if max_uses < 0:
+        return jsonify({'error': '최대 사용 횟수는 0 이상이어야 합니다.'}), 400
+    cid = db.create_coupon(code, discount_amount, max_uses)
+    if cid == -1:
+        return jsonify({'error': '이미 존재하는 쿠폰 코드입니다.'}), 400
+    return jsonify({'success': True, 'id': cid})
+
+@app.route('/api/coupons/<int:cid>', methods=['DELETE'])
+@login_required
+def api_delete_coupon(cid):
+    db.delete_coupon(cid)
+    return jsonify({'success': True})
+
+@app.route('/api/coupons/<int:cid>/toggle', methods=['POST'])
+@login_required
+def api_toggle_coupon(cid):
+    db.toggle_coupon(cid)
+    coupon = db.get_coupon(cid)
+    return jsonify({'success': True, 'active': coupon['active'] if coupon else 0})
 
 # --- Pushbullet test ---
 @app.route('/api/pushbullet/test', methods=['POST'])

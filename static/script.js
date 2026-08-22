@@ -13,6 +13,7 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
         if (tab === 'orders') loadOrders();
         if (tab === 'keys') loadKeys();
         if (tab === 'users') loadUsers();
+        if (tab === 'coupons') loadCoupons();
         if (tab === 'admins') loadAdmins();
     });
 });
@@ -526,6 +527,105 @@ async function deductPoints(userId) {
         }
     } catch (e) {
         showToast('포인트 차감 실패', 'error');
+    }
+}
+
+// ============ COUPONS (쿠폰 관리) ============
+async function loadCoupons() {
+    const container = document.getElementById('coupons-container');
+    container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">로딩중...</p>';
+    
+    try {
+        const resp = await fetch('/api/coupons');
+        const coupons = await resp.json();
+        
+        if (!Array.isArray(coupons) || coupons.length === 0) {
+            container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">등록된 쿠폰이 없습니다.</p>';
+            return;
+        }
+        
+        let html = '<table><thead><tr><th>ID</th><th>코드</th><th>할인 금액</th><th>사용 현황</th><th>상태</th><th>생성일</th><th>작업</th></tr></thead><tbody>';
+        coupons.forEach(function(c) {
+            const uses = c.max_uses > 0 ? c.used_count + '/' + c.max_uses : c.used_count + '/무제한';
+            html += '<tr>';
+            html += '<td>' + c.id + '</td>';
+            html += '<td><strong>' + c.code + '</strong></td>';
+            html += '<td>' + c.discount_amount.toLocaleString() + '포인트</td>';
+            html += '<td>' + uses + '</td>';
+            html += '<td>' + (c.active ? '<span class="badge badge-completed">활성</span>' : '<span class="badge badge-cancelled">비활성</span>') + '</td>';
+            html += '<td>' + c.created_at + '</td>';
+            html += '<td>';
+            html += '<button class="btn btn-warning btn-sm" onclick="toggleCoupon(' + c.id + ')"><i class="fas fa-toggle-on"></i> ' + (c.active ? '비활성화' : '활성화') + '</button> ';
+            html += '<button class="btn btn-danger btn-sm" onclick="deleteCoupon(' + c.id + ')"><i class="fas fa-trash"></i></button>';
+            html += '</td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color:#e74c3c;text-align:center;padding:20px;">쿠폰을 불러오는데 실패했습니다.</p>';
+    }
+}
+
+async function saveCoupon() {
+    const code = document.getElementById('coupon-code').value.trim();
+    const discount = parseInt(document.getElementById('coupon-discount').value);
+    const maxUses = parseInt(document.getElementById('coupon-max-uses').value);
+    
+    if (!code) {
+        showToast('쿠폰 코드를 입력해주세요.', 'error');
+        return;
+    }
+    if (!discount || discount <= 0) {
+        showToast('할인 금액을 입력해주세요.', 'error');
+        return;
+    }
+    
+    try {
+        const resp = await fetch('/api/coupons', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ code: code, discount_amount: discount, max_uses: isNaN(maxUses) ? 0 : maxUses })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('쿠폰이 생성되었습니다.', 'success');
+            document.getElementById('coupon-code').value = '';
+            document.getElementById('coupon-discount').value = '';
+            document.getElementById('coupon-max-uses').value = '0';
+            loadCoupons();
+        } else {
+            showToast(data.error || '쿠폰 생성 실패', 'error');
+        }
+    } catch (e) {
+        showToast('쿠폰 생성 실패', 'error');
+    }
+}
+
+async function deleteCoupon(id) {
+    if (!confirm('쿠폰을 삭제하시겠습니까?')) return;
+    try {
+        const resp = await fetch('/api/coupons/' + id, { method: 'DELETE' });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('쿠폰이 삭제되었습니다.', 'success');
+            loadCoupons();
+        }
+    } catch (e) {
+        showToast('쿠폰 삭제 실패', 'error');
+    }
+}
+
+async function toggleCoupon(id) {
+    try {
+        const resp = await fetch('/api/coupons/' + id + '/toggle', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('쿠폰 상태가 변경되었습니다.', 'success');
+            loadCoupons();
+        }
+    } catch (e) {
+        showToast('쿠폰 상태 변경 실패', 'error');
     }
 }
 
