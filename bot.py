@@ -121,90 +121,19 @@ class VendingBot(commands.Bot):
                 logger.error(f"Restore vending machine error: {e}")
     
     async def update_vending_machine(self, channel):
-        """Create or update the vending machine message with 5 main buttons"""
-        # Load custom settings
-        title = db.get_setting('vending_title', '냥코대전생 KEY shop')
-        desc = db.get_setting('vending_desc', "**원하시는 버튼을 선택해주세요.**\n\n📂 드롭다운에서 카테고리를 선택하면 바로 구매할 수 있습니다!")
-        footer = db.get_setting('vending_footer', '냥코 KEY 자판기 🐱 | 24시간 운영')
-        try:
-            color_hex = db.get_setting('vending_color', '0x3498db')
-            if color_hex.startswith('#'):
-                color_hex = color_hex.replace('#', '0x')
-            embed_color = discord.Color(int(color_hex, 16))
-        except:
-            embed_color = discord.Color.blue()
-        
-        product_title = db.get_setting('vending_product_title', '🏪 판매 중인 상품')
-        
-        from datetime import datetime as _dt
-        embed = discord.Embed(
-            title=title,
-            description=desc,
-            color=embed_color,
-            timestamp=_dt.now()
-        )
-        
-        # 상품 목록 (재고 상태 아이콘 포함, 카테고리 지원)
-        products = db.get_products(active_only=True)
-        use_categories = db.get_setting('use_categories', 'false').lower() == 'true'
-        
-        def _stock_line(p):
-            stock = db.count_available_keys(p['id'])
-            icon = '🟢' if stock > 0 else '🔴'
-            return f"{icon} {p['name']} — **{p['price']:,}원**"
-        
-        if use_categories:
-            categories = db.get_categories()
-            if categories:
-                for cat in categories[:4]:
-                    cat_products = db.get_products_by_category(cat, active_only=True)
-                    if not cat_products:
-                        continue
-                    embed.add_field(name=f"📂 {cat}", value="\n".join([_stock_line(p) for p in cat_products[:6]]), inline=True)
-                no_cat = [p for p in products if not p.get('category')]
-                if no_cat:
-                    embed.add_field(name="📦 기타", value="\n".join([_stock_line(p) for p in no_cat[:6]]), inline=True)
-            else:
-                embed.add_field(name=product_title, value="\n".join([_stock_line(p) for p in products[:10]]) or "상품 준비중", inline=False)
-        else:
-            embed.add_field(name=product_title, value="\n".join([_stock_line(p) for p in products[:10]]) or "상품 준비중", inline=False)
-        
-        # 실시간 현황
-        total_stock = sum(db.count_available_keys(p['id']) for p in products)
-        embed.add_field(
-            name="📈 실시간 현황",
-            value=f"📦 등록 상품: **{len(products)}개**　|　🔑 총 재고: **{total_stock}개**\n🟢 재고 있음　🔴 품절",
-            inline=False
-        )
-        
-        # 배너 이미지 (설정된 경우 임베드 하단에 크게 표시)
-        banner_url = db.get_setting('vending_banner_url', '')
-        if banner_url and banner_url.startswith('http'):
-            embed.set_image(url=banner_url)
-        
-        # 봇 아이콘을 author로 표시
-        try:
-            embed.set_author(name=footer.split('|')[0].strip(), icon_url=self.user.display_avatar.url)
-        except:
-            pass
-        
-        try:
-            embed.set_footer(text=footer, icon_url=self.user.display_avatar.url)
-        except:
-            embed.set_footer(text=footer)
-        
+        """Components V2 자판기 - 임베드 컨테이너 안에 드롭다운+버튼 통합"""
         view = VendingMainView()
         
         existing = db.get_vending_message(channel.id)
         if existing:
             try:
                 msg = await channel.fetch_message(int(existing['message_id']))
-                await msg.edit(embed=embed, view=view)
+                await msg.edit(view=view)
                 return
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Vending edit failed, resending: {e}")
         
-        msg = await channel.send(embed=embed, view=view)
+        msg = await channel.send(view=view)
         db.set_vending_message(channel.id, msg.id)
     
     async def grant_purchase_role(self, member, product_name=None):
@@ -407,43 +336,54 @@ class VendingBot(commands.Bot):
 
 # ============ VENDING MACHINE VIEWS ============
 
-class VendingMainView(discord.ui.View):
-    """Night Button 스타일: 드롭다운 + 제품/충전/정보/문의"""
+class VendingMainView(ui.LayoutView):
+    """Components V2: 임베드 컨테이너 안에 드롭다운+버튼이 통합됨"""
     def __init__(self):
         super().__init__(timeout=None)
         
-        # Row 0: 카테고리/상품 선택 드롭다운 (구매 기능 포함)
-        self.add_item(CategorySelect(row=0))
+        title = db.get_setting('vending_title', '냥코대전생 KEY shop')
+        desc = db.get_setting('vending_desc', '**원하시는 버튼을 선택해주세요.**')
+        footer = db.get_setting('vending_footer', '냥코 KEY 자판기 🐱 | 24시간 운영')
         
-        # Row 1: 제품 | 충전 | 정보 | 문의 (구매 버튼 제외 - 드롭다운이 대체)
-        self.add_item(VendingButton(
-            label="제품",
-            emoji="🎁",
-            style=discord.ButtonStyle.primary,
-            custom_id="vending_products",
-            row=1
-        ))
-        self.add_item(VendingButton(
-            label="충전",
-            emoji="💰",
-            style=discord.ButtonStyle.success,
-            custom_id="vending_charge",
-            row=1
-        ))
-        self.add_item(VendingButton(
-            label="정보",
-            emoji="ℹ️",
-            style=discord.ButtonStyle.secondary,
-            custom_id="vending_info",
-            row=1
-        ))
-        self.add_item(VendingButton(
-            label="문의",
-            emoji="🎫",
-            style=discord.ButtonStyle.danger,
-            custom_id="vending_ticket",
-            row=1
-        ))
+        try:
+            color_hex = db.get_setting('vending_color', '#5865F2')
+            if color_hex.startswith('#'):
+                color_hex = color_hex.replace('#', '0x')
+            accent = discord.Color(int(color_hex, 16))
+        except:
+            accent = discord.Color.blurple()
+        
+        # 실시간 현황 텍스트
+        products = db.get_products(active_only=True)
+        total_stock = sum(db.count_available_keys(p['id']) for p in products)
+        status_text = f"-# 📦 등록 상품 **{len(products)}개** · 🔑 총 재고 **{total_stock}개** · 🟢 재고있음 🔴 품절"
+        
+        children = [
+            ui.TextDisplay(f"## {title}"),
+            ui.TextDisplay(desc),
+            ui.TextDisplay("### 📂 카테고리 / 상품 선택"),
+            CategorySelect(),
+            ui.ActionRow(
+                VendingButton(label="제품", emoji="🎁", style=discord.ButtonStyle.primary, custom_id="vending_products"),
+                VendingButton(label="충전", emoji="💰", style=discord.ButtonStyle.success, custom_id="vending_charge"),
+                VendingButton(label="정보", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="vending_info"),
+                VendingButton(label="문의", emoji="🎫", style=discord.ButtonStyle.danger, custom_id="vending_ticket"),
+            ),
+            ui.TextDisplay(status_text),
+            ui.TextDisplay(f"-# {footer}"),
+        ]
+        
+        # 배너 이미지 (설정된 경우 컨테이너 하단에 크게 표시)
+        banner_url = db.get_setting('vending_banner_url', '')
+        if banner_url and banner_url.startswith('http'):
+            try:
+                gallery = ui.MediaGallery(discord.MediaGalleryItem(media=banner_url))
+                children.insert(-2, gallery)
+            except Exception as e:
+                logger.warning(f"Banner gallery error: {e}")
+        
+        container = ui.Container(*children, accent_color=accent)
+        self.add_item(container)
 
 
 class CategorySelect(discord.ui.Select):
