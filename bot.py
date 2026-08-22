@@ -123,8 +123,8 @@ class VendingBot(commands.Bot):
     async def update_vending_machine(self, channel):
         """Create or update the vending machine message with 5 main buttons"""
         # Load custom settings
-        title = db.get_setting('vending_title', '🐱 냥코 KEY 24시간 구매')
-        desc = db.get_setting('vending_desc', "**__아래 버튼을 눌러 이용해주세요!__**\n\n> 🛒 **구매** — 포인트로 KEY 즉시 구매\n> 💰 **충전** — 입금 후 포인트 자동 충전\n> 📦 **제품** — 판매 상품 & 재고 확인\n> ℹ️ **정보** — 내 포인트 · 구매내역\n> 🎫 **문의** — 1:1 문의 티켓 생성")
+        title = db.get_setting('vending_title', '냥코대전생 KEY shop')
+        desc = db.get_setting('vending_desc', "**원하시는 버튼을 선택해주세요.**\n\n📂 드롭다운에서 카테고리를 선택하면 바로 구매할 수 있습니다!")
         footer = db.get_setting('vending_footer', '냥코 KEY 자판기 🐱 | 24시간 운영')
         try:
             color_hex = db.get_setting('vending_color', '0x3498db')
@@ -408,26 +408,26 @@ class VendingBot(commands.Bot):
 # ============ VENDING MACHINE VIEWS ============
 
 class VendingMainView(discord.ui.View):
-    """Crime 스타일 자판기: 카테고리 드롭다운 + 버튼 rows"""
+    """Night Button 스타일: 드롭다운 + 제품/충전/정보/문의"""
     def __init__(self):
         super().__init__(timeout=None)
         
-        # Row 0: 카테고리 선택 드롭다운
+        # Row 0: 카테고리/상품 선택 드롭다운 (구매 기능 포함)
         self.add_item(CategorySelect(row=0))
         
-        # Row 1: 주요 버튼 4개 (Crime 스타일)
+        # Row 1: 제품 | 충전 | 정보 | 문의 (구매 버튼 제외 - 드롭다운이 대체)
+        self.add_item(VendingButton(
+            label="제품",
+            emoji="🎁",
+            style=discord.ButtonStyle.primary,
+            custom_id="vending_products",
+            row=1
+        ))
         self.add_item(VendingButton(
             label="충전",
             emoji="💰",
             style=discord.ButtonStyle.success,
             custom_id="vending_charge",
-            row=1
-        ))
-        self.add_item(VendingButton(
-            label="구매",
-            emoji="🛒",
-            style=discord.ButtonStyle.primary,
-            custom_id="vending_buy",
             row=1
         ))
         self.add_item(VendingButton(
@@ -438,20 +438,11 @@ class VendingMainView(discord.ui.View):
             row=1
         ))
         self.add_item(VendingButton(
-            label="제품",
-            emoji="🎁",
-            style=discord.ButtonStyle.secondary,
-            custom_id="vending_products",
-            row=1
-        ))
-        
-        # Row 2: 문의 버튼
-        self.add_item(VendingButton(
             label="문의",
             emoji="🎫",
             style=discord.ButtonStyle.danger,
             custom_id="vending_ticket",
-            row=2
+            row=1
         ))
 
 
