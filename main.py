@@ -51,18 +51,25 @@ bot = VendingBot()
 pushbullet_monitor = PushbulletMonitor()
 
 # ============ PING KEEPER (5분마다) ============
+def _get_ping_url():
+    """핑 대상 URL 조회: 설정의 dashboard_url 우선, 없으면 Render 외부 URL(RENDER_EXTERNAL_URL) 자동 사용"""
+    url = db.get_setting('dashboard_url', '')
+    if not url:
+        url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    return url.strip() if url else ''
+
 def ping_keeper():
-    """5분마다 대시보드 핑 전송 (서버 유지 + 상태 갱신)"""
+    """5분마다 서비스에 핑 전송 (Render 무료 플랜 슬립 방지)"""
     while True:
         try:
-            dashboard_url = db.get_setting('dashboard_url', '')
-            if dashboard_url:
-                resp = requests.get(dashboard_url.rstrip('/') + '/ping', timeout=10)
-                logger.info(f"[PING] Dashboard: {resp.status_code}")
+            url = _get_ping_url()
+            if url:
+                resp = requests.get(url.rstrip('/') + '/ping', timeout=10)
+                logger.info(f"[PING] {url}/ping -> {resp.status_code} (5분 후 재전송)")
             else:
-                logger.debug("Dashboard URL not set, skipping ping")
+                logger.warning("[PING] 핑 URL 미설정! 대시보드 설정에서 '대시보드 URL'을 저장하거나 RENDER_EXTERNAL_URL 환경변수가 필요합니다.")
         except Exception as e:
-            logger.warning(f"[PING] Dashboard error: {e}")
+            logger.warning(f"[PING] error: {e}")
         time.sleep(300)  # 5분
 
 # ============ DEPOSIT HANDLER ============
@@ -629,7 +636,7 @@ def start_ping_keeper():
     """Start 24h ping keeper"""
     thread = threading.Thread(target=ping_keeper, daemon=True)
     thread.start()
-    logger.info("Ping keeper started (24h interval)")
+    logger.info(f"Ping keeper 시작됨 (5분 간격 | 핑 URL: {_get_ping_url() or '미설정'})")
 
 # ============ STARTUP (runs on import for gunicorn) ============
 # Start bot

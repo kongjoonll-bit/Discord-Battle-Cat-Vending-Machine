@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio
 import logging
+import os
 import threading
 import time
 
@@ -41,21 +42,21 @@ class VendingBot(commands.Bot):
         """5분마다 대시보드/자판기 핑 자동 전송 (비블로킹)"""
         while True:
             try:
-                # 대시보드 핑 (스레드에서 실행하여 이벤트 루프 블로킹 방지)
-                dashboard_url = db.get_setting('dashboard_url', '')
-                if dashboard_url:
-                    def _do_ping(url=dashboard_url):
+                # 핑 URL: 설정값 우선, 없으면 Render 외부 URL(RENDER_EXTERNAL_URL) 자동 사용
+                ping_url = db.get_setting('dashboard_url', '') or os.environ.get('RENDER_EXTERNAL_URL', '')
+                if ping_url:
+                    def _do_ping(url=ping_url):
                         import requests as _req
                         try:
                             resp = _req.get(url.rstrip('/') + '/ping', timeout=10)
                             return resp.status_code
                         except Exception as e:
-                            logger.warning(f"[PING] Dashboard error: {e}")
+                            logger.warning(f"[PING] error: {e}")
                             return None
                     
                     status = await self.loop.run_in_executor(None, _do_ping)
                     if status:
-                        logger.info(f"[PING] Dashboard: {status}")
+                        logger.info(f"[PING] {ping_url} -> {status} (5분 후 재전송)")
                 
                 # 자판기 새로고침 (재고/상품 상태 최신화)
                 await self.refresh_vending_machines()
