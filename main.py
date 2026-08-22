@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 # Initialize database
 db.init_db()
 
+# 오타 자동 교정: 저장된 자판기 제목의 '냥코대전생' → '냥코대전쟁'
+_saved_title = db.get_setting('vending_title', '')
+if _saved_title and '냥코대전생' in _saved_title:
+    db.set_setting('vending_title', _saved_title.replace('냥코대전생', '냥코대전쟁'))
+    logger.info(f"자판기 제목 오타 자동 교정: {_saved_title} -> {db.get_setting('vending_title', '')}")
+
 # Create Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'nyanko-vending-secret-key-change-me')

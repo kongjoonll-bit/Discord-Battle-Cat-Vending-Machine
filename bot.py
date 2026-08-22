@@ -345,7 +345,7 @@ class VendingMainView(ui.LayoutView):
     def __init__(self):
         super().__init__(timeout=None)
         
-        title = db.get_setting('vending_title', '냥코대전생 KEY shop')
+        title = db.get_setting('vending_title', '냥코대전쟁 KEY shop')
         desc = db.get_setting('vending_desc', '**원하시는 버튼을 선택해주세요.**')
         footer = db.get_setting('vending_footer', '냥코 KEY 자판기 🐱 | 24시간 운영')
         
