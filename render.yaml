@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nyanko-vending
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PUSHBULLET_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
