@@ -177,6 +177,17 @@ class VendingBot(commands.Bot):
             inline=False
         )
         
+        # 배너 이미지 (설정된 경우 임베드 하단에 크게 표시)
+        banner_url = db.get_setting('vending_banner_url', '')
+        if banner_url and banner_url.startswith('http'):
+            embed.set_image(url=banner_url)
+        
+        # 봇 아이콘을 author로 표시
+        try:
+            embed.set_author(name=footer.split('|')[0].strip(), icon_url=self.user.display_avatar.url)
+        except:
+            pass
+        
         try:
             embed.set_footer(text=footer, icon_url=self.user.display_avatar.url)
         except:
@@ -397,45 +408,157 @@ class VendingBot(commands.Bot):
 # ============ VENDING MACHINE VIEWS ============
 
 class VendingMainView(discord.ui.View):
-    """Main vending machine with 5 buttons: 구매/충전/제품/정보/문의"""
+    """Crime 스타일 자판기: 카테고리 드롭다운 + 버튼 rows"""
     def __init__(self):
         super().__init__(timeout=None)
         
-        self.add_item(VendingButton(
-            label="구매",
-            emoji="🛒",
-            style=discord.ButtonStyle.primary,
-            custom_id="vending_buy",
-            row=0
-        ))
+        # Row 0: 카테고리 선택 드롭다운
+        self.add_item(CategorySelect(row=0))
+        
+        # Row 1: 주요 버튼 4개 (Crime 스타일)
         self.add_item(VendingButton(
             label="충전",
             emoji="💰",
             style=discord.ButtonStyle.success,
             custom_id="vending_charge",
-            row=0
+            row=1
         ))
         self.add_item(VendingButton(
-            label="제품",
-            emoji="📦",
-            style=discord.ButtonStyle.secondary,
-            custom_id="vending_products",
-            row=0
+            label="구매",
+            emoji="🛒",
+            style=discord.ButtonStyle.primary,
+            custom_id="vending_buy",
+            row=1
         ))
         self.add_item(VendingButton(
             label="정보",
             emoji="ℹ️",
             style=discord.ButtonStyle.secondary,
             custom_id="vending_info",
-            row=0
+            row=1
         ))
+        self.add_item(VendingButton(
+            label="제품",
+            emoji="🎁",
+            style=discord.ButtonStyle.secondary,
+            custom_id="vending_products",
+            row=1
+        ))
+        
+        # Row 2: 문의 버튼
         self.add_item(VendingButton(
             label="문의",
             emoji="🎫",
             style=discord.ButtonStyle.danger,
             custom_id="vending_ticket",
-            row=0
+            row=2
         ))
+
+
+class CategorySelect(discord.ui.Select):
+    """카테고리 선택 드롭다운 - 선택 시 해당 카테고리 상품 구매 메뉴 표시"""
+    def __init__(self, row=0):
+        categories = db.get_categories()
+        products = db.get_products(active_only=True)
+        
+        options = []
+        if categories:
+            for cat in categories[:24]:
+                cat_count = len(db.get_products_by_category(cat, active_only=True))
+                options.append(discord.SelectOption(
+                    label=cat,
+                    description=f"{cat_count}개 상품",
+                    emoji="📂"
+                ))
+        else:
+            for p in products[:24]:
+                stock = db.count_available_keys(p['id'])
+                options.append(discord.SelectOption(
+                    label=f"{p['name']} ({p['price']:,}원)",
+                    description=f"재고: {stock}개",
+                    value=str(p['id']),
+                    emoji="🛒"
+                ))
+        
+        if not options:
+            options = [discord.SelectOption(label="상품 준비중", value="none", emoji="⏳")]
+        
+        placeholder = "사용할 카테고리를 선택하세요" if categories else "구매할 상품을 선택하세요"
+        
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="vending_category_select",
+            row=row
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        
+        if selected == "none":
+            await interaction.response.send_message("⏳ 아직 상품이 등록되지 않았습니다.", ephemeral=True)
+            return
+        
+        # 카테고리 모드인지 상품 ID 모드인지 판단
+        categories = db.get_categories()
+        
+        if categories and selected in categories:
+            # 카테고리 선택 → 해당 카테고리 상품 구매 메뉴
+            cat_products = db.get_products_by_category(selected, active_only=True)
+            if not cat_products:
+                await interaction.response.send_message("❌ 해당 카테고리에 상품이 없습니다.", ephemeral=True)
+                return
+            
+            balance = db.get_balance(str(interaction.user.id))
+            
+            embed = discord.Embed(
+                title=f"📂 {selected}",
+                description=f"구매할 상품을 선택하세요!\n\n💰 현재 포인트: **{balance:,}원**",
+                color=discord.Color.blurple()
+            )
+            for p in cat_products:
+                stock = db.count_available_keys(p['id'])
+                icon = '🟢' if stock > 0 else '🔴'
+                embed.add_field(
+                    name=p['name'],
+                    value=f"{icon} **{p['price']:,}원** · 재고 {stock}개\n{p.get('description', '')}",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, view=BuyProductView(cat_products), ephemeral=True)
+        else:
+            # 상품 직접 선택 → 구매 확인
+            try:
+                pid = int(selected)
+            except:
+                await interaction.response.send_message("❌ 잘못된 선택입니다.", ephemeral=True)
+                return
+            
+            product = db.get_product(pid)
+            if not product or not product['active']:
+                await interaction.response.send_message("❌ 판매 중지된 상품입니다.", ephemeral=True)
+                return
+            
+            stock = db.count_available_keys(pid)
+            if stock <= 0:
+                await interaction.response.send_message("❌ 재고가 소진되었습니다.", ephemeral=True)
+                return
+            
+            balance = db.get_balance(str(interaction.user.id))
+            if balance < product['price']:
+                await interaction.response.send_message(
+                    f"❌ 포인트가 부족합니다!\n필요: {product['price']:,}포인트 | 보유: {balance:,}포인트\n\n💰 **충전** 버튼을 눌러 충전해주세요!",
+                    ephemeral=True
+                )
+                return
+            
+            await interaction.response.send_message(
+                f"✅ **{product['name']}** - {product['price']:,}포인트\n\n구매를 진행하시겠습니까?",
+                view=ConfirmBuyView(product),
+                ephemeral=True
+            )
 
 
 class VendingButton(discord.ui.Button):
