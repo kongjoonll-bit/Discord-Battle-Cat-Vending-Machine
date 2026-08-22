@@ -12,6 +12,8 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
+BOT_VERSION = 'v8.2'  # 자판기 컴포넌트 오류 수정 + 쿠폰 시스템 + 핑 폴백
+
 class VendingBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -26,7 +28,7 @@ class VendingBot(commands.Bot):
     async def setup_hook(self):
         await self.add_cog(VendingCommands(self))
         await self.tree.sync()
-        logger.info("Slash commands synced")
+        logger.info(f"========== 봇 버전 {BOT_VERSION} 로드 완료 (자판기 오류 수정본 배포 확인용) ==========")
     
     async def on_ready(self):
         logger.info(f"Bot logged in as {self.user} (ID: {self.user.id})")
