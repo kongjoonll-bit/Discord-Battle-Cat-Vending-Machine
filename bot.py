@@ -33,7 +33,7 @@ class VendingBot(commands.Bot):
     async def on_ready(self):
         logger.info(f"Bot logged in as {self.user} (ID: {self.user.id})")
         self.ready_event.set()
-        await self.change_presence(activity=discord.Game(name="냥코 KEY 자판기 🐱"))
+        await self.change_presence(activity=discord.Game(name=f"냥코 KEY 자판기 🐱 | {BOT_VERSION}"))
         await self.restore_vending_machines()
         # 5분 핑 자동 전송 시작 (중복 방지)
         if not getattr(self, '_ping_task_started', False):
@@ -1298,7 +1298,7 @@ class VendingCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         try:
             await self.bot.update_vending_machine(interaction.channel)
-            await interaction.followup.send("✅ 버튼 자판기가 설치되었습니다!", ephemeral=True)
+            await interaction.followup.send(f"✅ 버튼 자판기가 설치되었습니다! (버전: {BOT_VERSION})", ephemeral=True)
         except discord.Forbidden:
             await interaction.followup.send(
                 "❌ 봇에게 메시지 보내기 권한이 없습니다!\n\n"
@@ -1310,7 +1310,7 @@ class VendingCommands(commands.Cog):
         except Exception as e:
             logger.error(f"Setup vending error: {e}")
             await interaction.followup.send(
-                f"❌ 자판기 설치 중 오류가 발생했습니다: {str(e)}",
+                f"❌ 자판기 설치 중 오류가 발생했습니다 (실행 중 버전: {BOT_VERSION}): {str(e)}",
                 ephemeral=True
             )
     
