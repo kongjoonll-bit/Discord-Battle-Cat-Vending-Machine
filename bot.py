@@ -31,22 +31,30 @@ class VendingBot(commands.Bot):
         self.ready_event.set()
         await self.change_presence(activity=discord.Game(name="냥코 KEY 자판기 🐱"))
         await self.restore_vending_machines()
-        # 5분 핑 자동 전송 시작
-        self.loop.create_task(self.ping_loop())
+        # 5분 핑 자동 전송 시작 (중복 방지)
+        if not getattr(self, '_ping_task_started', False):
+            self._ping_task_started = True
+            self.loop.create_task(self.ping_loop())
     
     async def ping_loop(self):
-        """5분마다 대시보드/자판기 핑 자동 전송"""
-        import requests as _req
+        """5분마다 대시보드/자판기 핑 자동 전송 (비블로킹)"""
         while True:
             try:
-                # 대시보드 핑
+                # 대시보드 핑 (스레드에서 실행하여 이벤트 루프 블로킹 방지)
                 dashboard_url = db.get_setting('dashboard_url', '')
                 if dashboard_url:
-                    try:
-                        resp = _req.get(dashboard_url.rstrip('/') + '/ping', timeout=10)
-                        logger.info(f"[PING] Dashboard: {resp.status_code}")
-                    except Exception as e:
-                        logger.warning(f"[PING] Dashboard error: {e}")
+                    def _do_ping(url=dashboard_url):
+                        import requests as _req
+                        try:
+                            resp = _req.get(url.rstrip('/') + '/ping', timeout=10)
+                            return resp.status_code
+                        except Exception as e:
+                            logger.warning(f"[PING] Dashboard error: {e}")
+                            return None
+                    
+                    status = await self.loop.run_in_executor(None, _do_ping)
+                    if status:
+                        logger.info(f"[PING] Dashboard: {status}")
                 
                 # 자판기 새로고침 (재고/상품 상태 최신화)
                 await self.refresh_vending_machines()
@@ -116,7 +124,7 @@ class VendingBot(commands.Bot):
         """Create or update the vending machine message with 5 main buttons"""
         # Load custom settings
         title = db.get_setting('vending_title', '🐱 냥코 KEY 24시간 구매')
-        desc = db.get_setting('vending_desc', "🎰 **자판기 안내**\n\n아래 버튼을 이용해주세요!\n\n📦 **제품** - 판매 중인 상품을 확인\n💰 **충전** - 포인트 충전 안내\n🛒 **구매** - 포인트로 상품 구매\nℹ️ **정보** - 내 포인트/구매내역 확인\n🎫 **문의** - 1:1 문의 티켓 생성")
+        desc = db.get_setting('vending_desc', "**__아래 버튼을 눌러 이용해주세요!__**\n\n> 🛒 **구매** — 포인트로 KEY 즉시 구매\n> 💰 **충전** — 입금 후 포인트 자동 충전\n> 📦 **제품** — 판매 상품 & 재고 확인\n> ℹ️ **정보** — 내 포인트 · 구매내역\n> 🎫 **문의** — 1:1 문의 티켓 생성")
         footer = db.get_setting('vending_footer', '냥코 KEY 자판기 🐱 | 24시간 운영')
         try:
             color_hex = db.get_setting('vending_color', '0x3498db')
@@ -161,16 +169,11 @@ class VendingBot(commands.Bot):
         else:
             embed.add_field(name=product_title, value="\n".join([_stock_line(p) for p in products[:10]]) or "상품 준비중", inline=False)
         
-        # 이용 안내 + 실시간 현황
+        # 실시간 현황
         total_stock = sum(db.count_available_keys(p['id']) for p in products)
         embed.add_field(
-            name="📊 이용 안내",
-            value="**🛒 구매** → KEY 즉시 구매 (DM 발송)\n**💰 충전** → 입금 후 포인트 자동 충전\n**🎫 문의** → 1:1 문의 티켓",
-            inline=False
-        )
-        embed.add_field(
             name="📈 실시간 현황",
-            value=f"📦 등록 상품: **{len(products)}개** | 🔑 총 재고: **{total_stock}개**",
+            value=f"📦 등록 상품: **{len(products)}개**　|　🔑 총 재고: **{total_stock}개**\n🟢 재고 있음　🔴 품절",
             inline=False
         )
         
@@ -394,36 +397,41 @@ class VendingBot(commands.Bot):
 # ============ VENDING MACHINE VIEWS ============
 
 class VendingMainView(discord.ui.View):
-    """Main vending machine with 5 buttons: 제품/충전/구매/정보/문의"""
+    """Main vending machine with 5 buttons: 구매/충전/제품/정보/문의"""
     def __init__(self):
         super().__init__(timeout=None)
         
         self.add_item(VendingButton(
-            label="📦 제품",
-            style=discord.ButtonStyle.secondary,
-            custom_id="vending_products",
-            row=0
-        ))
-        self.add_item(VendingButton(
-            label="💰 충전",
-            style=discord.ButtonStyle.success,
-            custom_id="vending_charge",
-            row=0
-        ))
-        self.add_item(VendingButton(
-            label="🛒 구매",
+            label="구매",
+            emoji="🛒",
             style=discord.ButtonStyle.primary,
             custom_id="vending_buy",
             row=0
         ))
         self.add_item(VendingButton(
-            label="ℹ️ 정보",
+            label="충전",
+            emoji="💰",
+            style=discord.ButtonStyle.success,
+            custom_id="vending_charge",
+            row=0
+        ))
+        self.add_item(VendingButton(
+            label="제품",
+            emoji="📦",
+            style=discord.ButtonStyle.secondary,
+            custom_id="vending_products",
+            row=0
+        ))
+        self.add_item(VendingButton(
+            label="정보",
+            emoji="ℹ️",
             style=discord.ButtonStyle.secondary,
             custom_id="vending_info",
             row=0
         ))
         self.add_item(VendingButton(
-            label="🎫 문의",
+            label="문의",
+            emoji="🎫",
             style=discord.ButtonStyle.danger,
             custom_id="vending_ticket",
             row=0
