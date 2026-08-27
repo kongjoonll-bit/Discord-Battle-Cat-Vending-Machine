@@ -695,7 +695,7 @@ class VendingButton(discord.ui.Button):
         await interaction.followup.send(embed=embed, ephemeral=True)
     
     async def show_ticket(self, interaction):
-        """문의 티켓 생성"""
+        """문의 티켓 생성 (모든 유저 이용 가능)"""
         # Check if user already has an open ticket
         existing = db.get_open_ticket_by_user(str(interaction.user.id))
         if existing:
@@ -811,12 +811,13 @@ class CloseTicketButton(discord.ui.Button):
             await interaction.response.send_message("❌ 티켓을 찾을 수 없습니다.", ephemeral=True)
             return
         
-        # Check if user is ticket owner or admin
-        is_owner = str(interaction.user.id) == ticket['user_id']
-        is_admin = db.is_admin(str(interaction.user.id))
-        
-        if not is_owner and not is_admin:
-            await interaction.response.send_message("❌ 이 티켓을 닫을 권한이 없습니다.", ephemeral=True)
+        # 관리자만 티켓 닫기 가능
+        if not db.is_admin(str(interaction.user.id)):
+            await interaction.response.send_message(
+                "❌ **티켓은 관리자만 닫을 수 있습니다.**\n"
+                "문의가 해결되었으면 관리자에게 요청해주세요.",
+                ephemeral=True
+            )
             return
         
         # Close ticket

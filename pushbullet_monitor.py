@@ -38,11 +38,16 @@ class PushbulletMonitor:
     def __init__(self, on_deposit_detected=None):
         self.on_deposit_detected = on_deposit_detected
         self.running = False
-        self.thread = None
-        self.ws_thread = None
+        self.thread = None          # HTTP 폴링 스레드
+        self.ws_thread = None       # WebSocket 스레드
+        self.watchdog_thread = None # 감시자(Watchdog) 스레드
         self.last_processed_id = None
         self._lock = threading.Lock()
         self.ws = None
+        # 연결 상태 추적 (Watchdog 및 디버깅용)
+        self.ws_connected = False
+        self.last_ws_event_time = None   # 마지막 WebSocket 이벤트(연결/메시지) 시각
+        self.last_poll_time = None       # 마지막 HTTP 폴링 시각
         # 중복 알림 방지: 최근 처리한 알림 해시 캐시
         self._recent_processed = {}
         self._recent_processed_max = 100
@@ -56,21 +61,30 @@ class PushbulletMonitor:
         return token
 
     def start(self):
-        """Pushbullet 모니터 시작 (WebSocket 우선, HTTP 폴링 fallback)"""
+        """Pushbullet 모니터 시작 (WebSocket + HTTP 폴링 병행 + Watchdog 감시)"""
         if self.running:
             return
         self.running = True
 
-        # WebSocket 방식으로 시작 (실시간 감지)
+        # WebSocket 방식으로 시작 (실시간 감지) - websocket-client가 있으면 항상 사용
         if HAS_WEBSOCKET:
-            self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+            self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True, name="pb-websocket")
             self.ws_thread.start()
             logger.info("Pushbullet WebSocket 실시간 감지 스레드 시작")
         else:
-            # WebSocket 라이브러리가 없으면 HTTP 폴링 방식 사용
-            self.thread = threading.Thread(target=self._run_polling, daemon=True)
-            self.thread.start()
-            logger.info("Pushbullet HTTP 폴링 감지 스레드 시작 (websocket-client 미설치)")
+            logger.warning("websocket-client 미설치 - WebSocket 비활성")
+
+        # HTTP 폴링도 항상 함께 시작 (WebSocket 장애 시 백업 역할)
+        self.thread = threading.Thread(target=self._run_polling, daemon=True, name="pb-polling")
+        self.thread.start()
+        logger.info("Pushbullet HTTP 폴링 백업 스레드 시작 (30초 간격)")
+
+        # Watchdog: 스레드가 죽으면 자동 재시작 (자동충전 무응답 사고 방지)
+        self.watchdog_thread = threading.Thread(target=self._run_watchdog, daemon=True, name="pb-watchdog")
+        self.watchdog_thread.start()
+        logger.info("Pushbullet Watchdog 감시 스레드 시작 (60초 간격)")
+        
+        self._log_to_file("=== Pushbullet 모니터 시작 (WebSocket + 폴링 + Watchdog) ===")
 
     def stop(self):
         """Pushbullet 모니터 중지"""
@@ -80,11 +94,73 @@ class PushbulletMonitor:
                 self.ws.close()
             except:
                 pass
-        if self.thread:
-            self.thread.join(timeout=5)
-        if self.ws_thread:
-            self.ws_thread.join(timeout=5)
+        for t in (self.thread, self.ws_thread, self.watchdog_thread):
+            if t:
+                try:
+                    t.join(timeout=5)
+                except:
+                    pass
         logger.info("Pushbullet monitor stopped")
+
+    def get_status(self):
+        """모니터 상태 조회 (대시보드/API 표시용)"""
+        return {
+            'running': self.running,
+            'websocket_available': HAS_WEBSOCKET,
+            'ws_connected': self.ws_connected,
+            'last_ws_event': self.last_ws_event_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_ws_event_time else None,
+            'last_poll': self.last_poll_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_poll_time else None,
+            'ws_thread_alive': bool(self.ws_thread and self.ws_thread.is_alive()),
+            'poll_thread_alive': bool(self.thread and self.thread.is_alive()),
+        }
+
+    # ============================================================
+    # Watchdog (스레드 감시 - 죽으면 자동 재시작)
+    # ============================================================
+
+    def _run_watchdog(self):
+        """60초마다 각 스레드 생존 여부 확인 후 죽었으면 재시작"""
+        while self.running:
+            try:
+                time.sleep(60)
+                if not self.running:
+                    break
+                
+                # WebSocket 스레드 감시
+                if HAS_WEBSOCKET:
+                    ws_alive = self.ws_thread and self.ws_thread.is_alive()
+                    if not ws_alive:
+                        logger.error("⚠️ WebSocket 스레드 사망 감지! 자동 재시작합니다.")
+                        self._log_to_file("⚠️ WATCHDOG: WebSocket 스레드 사망 -> 재시작")
+                        self.ws_connected = False
+                        self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True, name="pb-websocket")
+                        self.ws_thread.start()
+                    elif not self.ws_connected:
+                        last = self.last_ws_event_time
+                        # 연결 시도 중인데 5분 넘게 이벤트가 없으면 스레드가 hang된 것으로 판단
+                        if last and (datetime.now() - last).total_seconds() > 300:
+                            logger.warning("⚠️ WebSocket이 5분 이상 응답 없음 - 강제 재연결 시도")
+                            self._log_to_file("⚠️ WATCHDOG: WebSocket 응답 없음 -> 강제 재연결")
+                            try:
+                                if self.ws:
+                                    self.ws.close()
+                            except:
+                                pass
+                
+                # HTTP 폴링 스레드 감시
+                poll_alive = self.thread and self.thread.is_alive()
+                if not poll_alive:
+                    logger.error("⚠️ HTTP 폴링 스레드 사망 감지! 자동 재시작합니다.")
+                    self._log_to_file("⚠️ WATCHDOG: 폴링 스레드 사망 -> 재시작")
+                    self.thread = threading.Thread(target=self._run_polling, daemon=True, name="pb-polling")
+                    self.thread.start()
+                
+                # 상태 요약 로그 (10분마다 한 번 정도만 기록되도록 600초마다)
+                if int(time.time()) % 600 < 60:
+                    status = self.get_status()
+                    self._log_to_file(f"상태 보고: {status}")
+            except Exception as e:
+                logger.error(f"Watchdog error: {e}")
 
     def _log_to_file(self, message):
         """로그를 파일에 기록"""
@@ -124,12 +200,21 @@ class PushbulletMonitor:
                 token = self.get_token()
                 if not token:
                     logger.warning("Pushbullet 토큰이 설정되지 않았습니다. 10초 후 재시도...")
+                    self._log_to_file("⚠️ 토큰 미설정 - 10초 후 재시도")
                     time.sleep(10)
                     continue
 
+                self.last_ws_event_time = datetime.now()
                 self._connect_websocket(token)
+                # run_forever가 반환되면 연결이 끊긴 것 - 잠시 후 재연결
+                self.ws_connected = False
+                if self.running:
+                    logger.warning("WebSocket run_forever 종료됨 - 5초 후 재연결 시도")
+                    self._log_to_file("⚠️ WebSocket 연결 끊김 - 5초 후 재연결")
+                    time.sleep(5)
             except Exception as e:
                 logger.error(f"WebSocket 실행 오류: {e}")
+                self._log_to_file(f"❌ WebSocket 실행 오류: {e}")
                 time.sleep(10)
 
     def _connect_websocket(self, token):
@@ -137,11 +222,19 @@ class PushbulletMonitor:
         ws_url = f"wss://stream.pushbullet.com/websocket/{token}"
 
         def on_open(ws):
+            self.ws_connected = True
+            self.last_ws_event_time = datetime.now()
             logger.info("🟢 Pushbullet WebSocket 연결 성공! 실시간 입금 알림 감지 시작")
+            self._log_to_file("🟢 WebSocket 연결 성공")
 
         def on_message(ws, message):
             try:
+                self.last_ws_event_time = datetime.now()
                 data = json.loads(message)
+                
+                # Pushbullet 서버의 연결 유지(tickle/nop) 응답도 정상 신호로 기록
+                if data.get("type") in ("tickle", "nop"):
+                    return
                 # Pushbullet에서 안드로이드 앱 알림(mirror)이 도착한 이벤트 감지
                 if data.get("type") == "push" and data.get("push", {}).get("type") == "mirror":
                     push = data["push"]
@@ -171,10 +264,13 @@ class PushbulletMonitor:
 
         def on_error(ws, error):
             logger.error(f"❌ Pushbullet WebSocket 에러: {error}")
+            self._log_to_file(f"❌ WebSocket 에러: {error}")
 
         def on_close(ws, close_status_code, close_msg):
-            logger.warning(f"⚠️ Pushbullet WebSocket 연결 종료 (코드: {close_status_code}). 5초 후 재연결...")
-            time.sleep(5)
+            self.ws_connected = False
+            self.last_ws_event_time = datetime.now()
+            logger.warning(f"⚠️ Pushbullet WebSocket 연결 종료 (코드: {close_status_code}). 자동 재연결됩니다...")
+            self._log_to_file(f"⚠️ WebSocket 연결 종료 (코드: {close_status_code}) - 재연결 대기")
 
         self.ws = websocket.WebSocketApp(
             ws_url,
@@ -183,19 +279,27 @@ class PushbulletMonitor:
             on_error=on_error,
             on_close=on_close
         )
-        # run_forever는 블로킹 호출 - 재접속을 자동으로 처리
-        self.ws.run_forever(
-            ping_interval=30,
-            ping_timeout=10,
-            reconnect=5
-        )
+        # run_forever는 블로킹 호출 - ping 유지 및 자동 재접속 처리
+        # (on_close에서 sleep하지 않음: 콜백 스레드 블로킹으로 인한 hang 방지)
+        while self.running:
+            try:
+                self.ws.run_forever(
+                    ping_interval=30,
+                    ping_timeout=10,
+                    reconnect=5
+                )
+            except Exception as e:
+                logger.error(f"WebSocket run_forever 오류: {e}")
+                self._log_to_file(f"❌ run_forever 오류: {e}")
+            if self.running:
+                time.sleep(5)
 
     # ============================================================
     # HTTP 폴링 방식 (fallback - 기존 방식)
     # ============================================================
 
     def _run_polling(self):
-        """HTTP API 폴링 방식으로 푸시 알림 확인 (fallback)"""
+        """HTTP API 폴링 방식으로 푸시 알림 확인 (백업 - WebSocket 장애 시에도 동작)"""
         while self.running:
             try:
                 token = self.get_token()
@@ -205,7 +309,9 @@ class PushbulletMonitor:
                     logger.warning("Pushbullet 토큰이 설정되지 않았습니다.")
             except Exception as e:
                 logger.error(f"Pushbullet monitor error: {e}")
-            time.sleep(10)
+                self._log_to_file(f"❌ 폴링 오류: {e}")
+            self.last_poll_time = datetime.now()
+            time.sleep(30)  # 30초 간격 (WebSocket 백업 용도이므로 부하 줄임)
 
     def _check_pushes(self, token):
         """HTTP API로 푸시 알림 확인 (폴링 방식)"""

@@ -78,6 +78,82 @@ def ping_keeper():
             logger.warning(f"[PING] error: {e}")
         time.sleep(300)  # 5분
 
+# ============ SAFE DISCORD SENDERS (로그 전송 실패 시 반드시 기록) ============
+def send_to_discord_channel(setting_key, embed=None, content=None):
+    """설정된 채널로 메시지 전송 (봇 이벤트 루프에서 안전 실행 + 모든 실패 원인 로깅)
+    
+    기존 문제 수정:
+    - get_channel 캐시 미스 시 fetch_channel로 재시도
+    - run_coroutine_threadsafe 결과 확인 → 전송 실패 사유를 터미널 로그에 기록
+    - 채널 ID 미설정/봇 미준비 시에도 경고 로그 남김 (조용히 실패하지 않음)
+    """
+    cid = db.get_setting(setting_key, '')
+    if not cid:
+        logger.warning(f"[DISCORD] '{setting_key}' 채널 ID가 미설정이라 전송 생략! (대시보드 설정에서 채널 ID를 저장하세요)")
+        return False
+    if not bot.is_ready():
+        logger.warning(f"[DISCORD] 봇이 아직 준비되지 않아 '{setting_key}' 채널 전송 생략")
+        return False
+
+    async def _do_send():
+        try:
+            channel = bot.get_channel(int(cid))
+            if not channel:
+                channel = await bot.fetch_channel(int(cid))
+        except discord.NotFound:
+            logger.error(f"[DISCORD] '{setting_key}' 채널(ID:{cid})을 찾을 수 없습니다! 채널 ID를 확인하세요.")
+            return False
+        except discord.Forbidden:
+            logger.error(f"[DISCORD] '{setting_key}' 채널(ID:{cid}) 접근 권한이 없습니다! 봇 권한을 확인하세요.")
+            return False
+        except Exception as e:
+            logger.error(f"[DISCORD] '{setting_key}' 채널 조회 오류: {e}")
+            return False
+
+        if not channel:
+            logger.error(f"[DISCORD] '{setting_key}' 채널(ID:{cid})을 찾을 수 없습니다!")
+            return False
+
+        try:
+            if embed and content:
+                await channel.send(content=content, embed=embed)
+            elif embed:
+                await channel.send(embed=embed)
+            elif content:
+                await channel.send(content)
+            logger.info(f"[DISCORD] '{setting_key}' 채널로 로그 전송 성공")
+            return True
+        except Exception as e:
+            logger.error(f"[DISCORD] '{setting_key}' 채널 전송 오류: {e}")
+            return False
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_send(), bot.loop)
+        return bool(future.result(timeout=20))
+    except Exception as e:
+        logger.error(f"[DISCORD] '{setting_key}' 전송 스케줄 오류: {e}")
+        return False
+
+
+def send_dm_safe(user_id, embed=None, content=None):
+    """DM 전송 (봇 이벤트 루프에서 안전하게 실행 - 기존 별도 루프 방식의 버그 수정)"""
+    if not bot.is_ready():
+        logger.warning("[DISCORD] 봇이 아직 준비되지 않아 DM 전송 생략")
+        return False
+
+    async def _do_send():
+        return await bot.send_dm(user_id, content=content, embed=embed)
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_send(), bot.loop)
+        ok = future.result(timeout=20)
+        if not ok:
+            logger.warning(f"[DISCORD] DM 전송 실패 (유저 ID: {user_id}) - DM 차단 또는 잘못된 ID일 수 있음")
+        return bool(ok)
+    except Exception as e:
+        logger.error(f"[DISCORD] DM 전송 오류 (유저 ID: {user_id}): {e}")
+        return False
+
 # ============ DEPOSIT HANDLER ============
 def handle_deposit(amount, text, depositor=None):
     """Handle detected deposit from Pushbullet - auto point award when amount AND depositor name match"""
@@ -152,57 +228,33 @@ def handle_deposit(amount, text, depositor=None):
         db.complete_charge_request(charge['id'])
         
         # Notify user via DM with auto charge confirmation
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            embed = discord.Embed(
-                title="✅ 포인트 충전 완료!",
-                description=f"{amount:,}포인트가 충전되었습니다!",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="입금자명", value=charge['depositor_name'], inline=True)
-            embed.add_field(name="충전 금액", value=f"{amount:,}포인트", inline=True)
-            embed.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
-            embed.set_footer(text="냥코 KEY 자판기 🐱")
-            
-            loop.run_until_complete(bot.send_dm(charge['user_id'], embed=embed))
-            loop.close()
-        except Exception as e:
-            logger.error(f"Charge DM error: {e}")
+        embed = discord.Embed(
+            title="✅ 포인트 충전 완료!",
+            description=f"{amount:,}포인트가 충전되었습니다!",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="입금자명", value=charge['depositor_name'], inline=True)
+        embed.add_field(name="충전 금액", value=f"{amount:,}포인트", inline=True)
+        embed.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
+        embed.set_footer(text="냥코 KEY 자판기 🐱")
+        send_dm_safe(charge['user_id'], embed=embed)
         
         # Send deposit log to deposit log channel
-        deposit_log_channel_id = db.get_setting('deposit_log_channel_id', '')
-        if deposit_log_channel_id and bot.is_ready():
-            try:
-                channel = bot.get_channel(int(deposit_log_channel_id))
-                if channel:
-                    embed_log = discord.Embed(
-                        title="💰 입금 확인!",
-                        description=f"**{charge['username']}** 님의 입금이 확인되었습니다!",
-                        color=discord.Color.green(),
-                        timestamp=datetime.now()
-                    )
-                    embed_log.add_field(name="입금자명", value=charge['depositor_name'], inline=True)
-                    embed_log.add_field(name="입금 금액", value=f"{amount:,}원", inline=True)
-                    embed_log.add_field(name="충전 포인트", value=f"{amount:,}포인트", inline=True)
-                    embed_log.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
-                    asyncio.run_coroutine_threadsafe(channel.send(embed=embed_log), bot.loop)
-            except Exception as e:
-                logger.error(f"Deposit log channel error: {e}")
+        embed_log = discord.Embed(
+            title="💰 입금 확인!",
+            description=f"**{charge['username']}** 님의 입금이 확인되었습니다!",
+            color=discord.Color.green(),
+            timestamp=datetime.now()
+        )
+        embed_log.add_field(name="입금자명", value=charge['depositor_name'], inline=True)
+        embed_log.add_field(name="입금 금액", value=f"{amount:,}원", inline=True)
+        embed_log.add_field(name="충전 포인트", value=f"{amount:,}포인트", inline=True)
+        embed_log.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
+        send_to_discord_channel('deposit_log_channel_id', embed=embed_log)
         
         # Notify admin channel (always for tracking)
-        admin_channel_id = db.get_setting('admin_channel_id', '')
-        if admin_channel_id and bot.is_ready():
-            try:
-                channel = bot.get_channel(int(admin_channel_id))
-                if channel:
-                    asyncio.run_coroutine_threadsafe(
-                        channel.send(f"💰 **충전 완료!**\n{charge['username']} 님이 {amount:,}포인트 충전\n입금자명: {charge['depositor_name']}"),
-                        bot.loop
-                    )
-            except Exception as e:
-                logger.error(f"Admin channel notify error: {e}")
+        send_to_discord_channel('admin_channel_id',
+            content=f"💰 **충전 완료!**\n{charge['username']} 님이 {amount:,}포인트 충전\n입금자명: {charge['depositor_name']}")
         
         return  # Deposit processed, don't continue to unallocated
     
@@ -210,35 +262,19 @@ def handle_deposit(amount, text, depositor=None):
     logger.info(f"No matching charge request for {amount:,}원 (depositor: {depositor})")
     
     # Send deposit log to deposit log channel (unmatched)
-    deposit_log_channel_id = db.get_setting('deposit_log_channel_id', '')
-    if deposit_log_channel_id and bot.is_ready():
-        try:
-            channel = bot.get_channel(int(deposit_log_channel_id))
-            if channel:
-                embed_log = discord.Embed(
-                    title="💰 입금 감지 (미할당)",
-                    description=f"금액: {amount:,}원\n내용: {text[:150]}",
-                    color=discord.Color.orange(),
-                    timestamp=datetime.now()
-                )
-                if depositor:
-                    embed_log.add_field(name="예상 입금자", value=depositor, inline=True)
-                asyncio.run_coroutine_threadsafe(channel.send(embed=embed_log), bot.loop)
-        except Exception as e:
-            logger.error(f"Deposit log channel error: {e}")
+    embed_log = discord.Embed(
+        title="💰 입금 감지 (미할당)",
+        description=f"금액: {amount:,}원\n내용: {text[:150]}",
+        color=discord.Color.orange(),
+        timestamp=datetime.now()
+    )
+    if depositor:
+        embed_log.add_field(name="예상 입금자", value=depositor, inline=True)
+    send_to_discord_channel('deposit_log_channel_id', embed=embed_log)
     
     # Notify admin channel about unallocated deposit
-    admin_channel_id = db.get_setting('admin_channel_id', '')
-    if admin_channel_id and bot.is_ready():
-        try:
-            channel = bot.get_channel(int(admin_channel_id))
-            if channel:
-                asyncio.run_coroutine_threadsafe(
-                    channel.send(f"💰 **입금 감지됨 (미할당)**\n금액: {amount:,}원\n내용: {text[:100]}\n\n대시보드에서 유저에게 포인트를 지급해주세요!"),
-                    bot.loop
-                )
-        except Exception as e:
-            logger.error(f"Admin channel notify error: {e}")
+    send_to_discord_channel('admin_channel_id',
+        content=f"💰 **입금 감지됨 (미할당)**\n금액: {amount:,}원\n내용: {text[:100]}\n\n대시보드에서 유저에게 포인트를 지급해주세요!")
 
 # ============ AUTH DECORATOR ============
 def login_required(f):
@@ -603,6 +639,16 @@ def api_toggle_coupon(cid):
 def api_test_pushbullet():
     success, msg = pushbullet_monitor.test_connection()
     return jsonify({'success': success, 'message': msg})
+
+@app.route('/api/pushbullet/status', methods=['GET'])
+@login_required
+def api_pushbullet_status():
+    """자동충전(Pushbullet) 모니터 상태 조회 - 고장 진단용"""
+    token_set = bool(pushbullet_monitor.get_token())
+    return jsonify({
+        'token_set': token_set,
+        **pushbullet_monitor.get_status()
+    })
 
 # --- Stats ---
 @app.route('/api/stats', methods=['GET'])
