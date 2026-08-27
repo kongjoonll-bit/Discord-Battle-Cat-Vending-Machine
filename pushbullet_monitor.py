@@ -235,9 +235,22 @@ class PushbulletMonitor:
                 # Pushbullet 서버의 연결 유지(tickle/nop) 응답도 정상 신호로 기록
                 if data.get("type") in ("tickle", "nop"):
                     return
+
+                # [진단 로깅] tickle/nop을 제외한 모든 이벤트를 로그에 남겨
+                # 폰 -> Pushbullet 미러링이 실제로 도달하는지 확인할 수 있게 함
+                _evt = data.get("type")
+                _pobj = data.get("push") if isinstance(data.get("push"), dict) else {}
+                _detail = ""
+                if _evt == "push":
+                    _t = str(_pobj.get("title") or "")[:40]
+                    _b = str(_pobj.get("body") or "")[:60]
+                    _detail = f", push.type={_pobj.get('type')}, package={_pobj.get('package_name')}, title={_t}, body={_b}"
+                logger.info(f"📩 [PB수신] event={_evt}{_detail}")
+                self._log_to_file(f"[PB수신] event={_evt}{_detail}")
+
                 # Pushbullet에서 안드로이드 앱 알림(mirror)이 도착한 이벤트 감지
-                if data.get("type") == "push" and data.get("push", {}).get("type") == "mirror":
-                    push = data["push"]
+                if _evt == "push" and _pobj.get("type") == "mirror":
+                    push = _pobj
                     package_name = push.get("package_name", "").lower()
                     title = push.get("title", "") or ""
                     body = push.get("body", "") or ""
