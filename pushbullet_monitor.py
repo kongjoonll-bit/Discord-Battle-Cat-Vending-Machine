@@ -190,6 +190,133 @@ class PushbulletMonitor:
         return False
 
     # ============================================================
+    # 자판기뿌리기용(comet.py) 원리 포팅: 은행별 전용 파서 + 통합 처리
+    # ============================================================
+
+    BANK_PACKAGES = (
+        "com.IBK.SmartPush.app",
+        "com.nh.mobilenoti",
+        "com.wooribank.smart.npib",
+        "com.kakaobank.channel",
+        "com.samsung.android.messaging",
+    )
+    KAKAO_BUFFER_WINDOW_SECONDS = 10
+
+    def _process_incoming_push(self, package_name, title, body):
+        """모든 푸시 이벤트 통합 처리 (WebSocket/폴링 공용 진입점)"""
+        combined_text = f"{title} {body}" if title else body
+        if package_name and package_name not in self.BANK_PACKAGES and "입금" not in combined_text:
+            return False
+        depositor, amount = self._extract_from_push(package_name, title, body)
+        full_text = f"{title} {body}"
+        if not depositor or not amount or amount <= 0:
+            return False
+        logger.info(f"💰 [실시간 입금 알림] 금액: {amount}원, 입금자: {depositor}")
+        self._log_to_file(f"✅ 입금 감지 완료: {depositor}, {amount}원 (pkg={package_name})")
+        if self._is_duplicate(f"{package_name}|{depositor}|{amount}"):
+            return True
+        if self.on_deposit_detected:
+            self.on_deposit_detected(amount, full_text, depositor)
+        return True
+
+    def _extract_from_push(self, package_name, title="", body=""):
+        """(은행별 전용 파서 분기 진입점)"""
+        if package_name == "com.kakaobank.channel":
+            return self._parse_kakaobank_buffered(body, title)
+        return self.parse_generic_bank_notification(package_name, body)
+
+    def parse_generic_bank_notification(self, package_name, body):
+        """IBK / 농협 / 우리은행 / 삼성 문자앱 / 범용 폴백 파싱"""
+        body_normalized = body.replace("\n", " ")
+        message_parts = body_normalized.replace("원", "").replace(",", "").split(" ")
+        displayname = ""
+        count = 0
+        try:
+            if package_name == "com.IBK.SmartPush.app":
+                sp = body_normalized.split(" ")
+                if len(sp) >= 3:
+                    displayname = sp[2]
+                    count = int(sp[1].replace("원", "").replace(",", ""))
+            elif package_name == "com.nh.mobilenoti":
+                if len(message_parts) >= 6:
+                    displayname = message_parts[5]
+                    count_str = message_parts[1].replace("입금", "").replace("원", "").replace(",", "")
+                    count = int(count_str)
+            elif package_name == "com.wooribank.smart.npib":
+                sp = body_normalized.split(" ")
+                if len(sp) >= 6:
+                    displayname = sp[1]
+                    count = int(sp[5].replace("원", "").replace(",", ""))
+            elif package_name == "com.samsung.android.messaging":
+                amt_match = re.search(r"입금\s*([\d,]+)\s*원", body) or re.search(r"입금([\d,]+)원", body)
+                if amt_match:
+                    count = int(amt_match.group(1).replace(",", ""))
+                name_match = re.search(r"\d+-\*+-\d+-\d+\s+([가-힣]{2,4})\s+잔액", body)
+                if name_match:
+                    displayname = name_match.group(1).strip()
+                if not displayname:
+                    for p in body.replace("\n", " ").split():
+                        if re.fullmatch(r"[가-힣]{2,4}", p) and p not in ("농협", "입금", "잔액"):
+                            displayname = p
+                            break
+            else:
+                amt_match = re.search(r"입금\s*([\d,]+)원", body)
+                if not amt_match:
+                    amt_match = re.search(r"([\d,]+)원\s*입금", body)
+                if amt_match:
+                    count = int(amt_match.group(1).replace(",", ""))
+                    for ln in [ln.strip() for ln in body.splitlines() if ln.strip()]:
+                        if re.search(r"[가-힣]{2,4}", ln) and "원" not in ln and "잔액" not in ln:
+                            displayname = re.sub(r"[^가-힣]", "", ln)
+                            if 2 <= len(displayname) <= 4:
+                                break
+            if count > 0 and displayname:
+                return displayname, count
+            return None, None
+        except Exception as e:
+            logger.error(f"[PB파서] 오류({package_name}): {e}")
+            return None, None
+
+    def _parse_kakaobank_buffered(self, body, title=""):
+        """카카오뱅크 멀티파트 알림: 최근 10초 내 조각을 합쳐 파싱"""
+        try:
+            if not hasattr(self, "_kakao_buffer"):
+                self._kakao_buffer = []
+            now_ts = time.time()
+            self._kakao_buffer = [
+                n for n in self._kakao_buffer
+                if now_ts - n["ts"] <= self.KAKAO_BUFFER_WINDOW_SECONDS
+            ]
+            self._kakao_buffer.append({"body": body, "title": title, "ts": now_ts})
+            all_bodies = " ".join(n["body"] for n in self._kakao_buffer)
+            amt_match = (re.search(r"입금\s*([\d,]+)\s*원", all_bodies)
+                         or re.search(r"([\d,]+)\s*원\s*입금", all_bodies)
+                         or re.search(r"[+\-]?\s*([\d,]+)\s*원", all_bodies)
+                         or re.search(r"([\d,]+)\s*원", all_bodies))
+            if not amt_match:
+                large_number_match = re.search(r"([1-9]\d{3,})", all_bodies)
+                if large_number_match and int(large_number_match.group(1)) >= 1000:
+                    amt_match = large_number_match
+            count = 0
+            displayname = ""
+            if amt_match:
+                count = int(amt_match.group(1).replace(",", ""))
+            if not displayname:
+                skip_words = ("입금", "출금", "이체", "충전", "통장", "계좌", "농협", "우리", "카카오")
+                name_pattern = re.search(r"([가-힣]{2,4})", all_bodies)
+                if name_pattern:
+                    potential_name = name_pattern.group(1)
+                    if not re.search(r"\d", potential_name) and "통장" not in potential_name and potential_name not in skip_words:
+                        displayname = potential_name
+            if count > 0 and displayname:
+                return displayname, count
+            self._log_to_file(f"⏳ 카카오뱅크 버퍼 대기 (입금자:{displayname or '없음'}, 금액:{count or 0})")
+            return None, None
+        except Exception as e:
+            logger.error(f"[PB파서] 카카오뱅크 오류: {e}")
+            return None, None
+
+    # ============================================================
     # WebSocket 방식 (실시간 감지 - superchat.py와 동일한 원리)
     # ============================================================
 
@@ -248,30 +375,17 @@ class PushbulletMonitor:
                 logger.info(f"📩 [PB수신] event={_evt}{_detail}")
                 self._log_to_file(f"[PB수신] event={_evt}{_detail}")
 
-                # Pushbullet에서 안드로이드 앱 알림(mirror)이 도착한 이벤트 감지
-                if _evt == "push" and _pobj.get("type") == "mirror":
-                    push = _pobj
-                    package_name = push.get("package_name", "").lower()
-                    title = push.get("title", "") or ""
-                    body = push.get("body", "") or ""
-                    full_text = f"{title} {body}"
-
-                    self._log_to_file(f"WebSocket 알림 수신: {full_text[:200]}")
-
-                    # 토스 관련 앱 알림이거나 알림 텍스트에 토스/입금이 잡히는 경우 필터링
-                    if self._is_deposit_notification(full_text, package_name):
-                        # 중복 알림 방지 (같은 알림이 여러 번 오는 경우 1번만 처리)
-                        if self._is_duplicate(full_text):
-                            return
-
-                        amount = self._extract_amount(full_text)
-                        depositor = self._extract_depositor(full_text)
-
-                        self._log_to_file(f"입금 감지 (WebSocket): amount={amount}, depositor={depositor}, text={full_text[:200]}")
-                        logger.info(f"💰 [실시간 입금 알림] 금액: {amount}원, 입금자: {depositor}")
-
-                        if amount and self.on_deposit_detected:
-                            self.on_deposit_detected(amount, full_text, depositor)
+                # 모든 push 이벤트를 통합 처리 (mirror/note 구분 없음 - comet.py 원리)
+                if _evt == "push":
+                    pkg = str(_pobj.get("package_name") or "")
+                    ttl = str(_pobj.get("title") or "")
+                    bdy = str(_pobj.get("body") or "")
+                    self._log_to_file(f"WebSocket 알림 수신: pkg={pkg}, {ttl[:60]} {bdy[:120]}")
+                    try:
+                        self._process_incoming_push(pkg, ttl, bdy)
+                    except Exception as e:
+                        logger.error(f"[PB처리] 오류: {e}")
+                        self._log_to_file(f"❌ 푸시 처리 오류: {e}")
             except Exception as e:
                 logger.error(f"WebSocket 메시지 파싱 오류: {e}")
 
@@ -356,23 +470,14 @@ class PushbulletMonitor:
                 body = push.get('body', '') or ''
                 title = push.get('title', '') or ''
                 text = f"{title} {body}"
+                pkg = str(push.get("package_name") or "")
 
-                self._log_to_file(f"Push received: {text[:200]}")
-                logger.info(f"Push received: {text[:100]}")
+                logger.info(f"Push received: type={push.get('type')}, pkg={pkg}, text={text[:100]}")
 
-                if self._is_deposit_notification(text):
-                    # 중복 알림 방지 (같은 알림이 여러 번 오는 경우 1번만 처리)
-                    if self._is_duplicate(text):
-                        continue
-
-                    amount = self._extract_amount(text)
-                    depositor = self._extract_depositor(text)
-
-                    self._log_to_file(f"Deposit detected: amount={amount}, depositor={depositor}, text={text[:200]}")
-                    logger.info(f"Deposit detected: {amount}원, depositor: {depositor}")
-
-                    if amount and self.on_deposit_detected:
-                        self.on_deposit_detected(amount, text, depositor)
+                try:
+                    self._process_incoming_push(pkg, title, body)
+                except Exception as e:
+                    logger.error(f"[PB처리] 폴링 오류: {e}")
 
                 self.last_processed_id = push_id
         except Exception as e:
