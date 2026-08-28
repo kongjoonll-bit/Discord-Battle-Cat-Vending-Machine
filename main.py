@@ -1,4 +1,14 @@
 import os
+import sys
+
+# Windows 콘솔(cp949)에서 이모지/한글 출력 크래시 방지
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import logging
 import threading
 import time
@@ -649,6 +659,61 @@ def api_pushbullet_status():
         'token_set': token_set,
         **pushbullet_monitor.get_status()
     })
+
+# ============ 입금 웹훅 (Pushbullet 없이 폰 앱이 은행 알림을 직접 전송) ============
+DEPOSIT_WEBHOOK_SETTING_KEY = 'deposit_webhook_key'
+
+def _get_or_create_webhook_key():
+    """입금 웹훅 인증 키 조회 (없으면 환경변수 또는 자동 생성해서 DB에 저장)"""
+    saved = db.get_setting(DEPOSIT_WEBHOOK_SETTING_KEY, '')
+    if saved:
+        return saved
+    saved = os.environ.get('DEPOSIT_WEBHOOK_KEY', '')
+    if not saved:
+        saved = secrets.token_hex(16)
+    db.set_setting(DEPOSIT_WEBHOOK_SETTING_KEY, saved)
+    logger.info(f"[WEBHOOK] 입금 웹훅 인증 키 생성됨: {saved}")
+    return saved
+
+@app.route('/api/deposit-webhook', methods=['GET', 'POST'])
+def api_deposit_webhook():
+    """폰 알림 전달 앱(MacroDroid 등)이 은행 알림을 직접 POST하는 엔드포인트.
+
+    Body(JSON): {"title": "...", "body": "...", "package": "..."}
+    인증: ?key=... 또는 헤더 X-Webhook-Key (대시보드/서버 로그의 키와 일치해야 함)
+    처리는 Pushbullet과 완전히 동일한 파서/매칭 로직을 재사용한다.
+    """
+    if request.method == 'GET':
+        # 폰 앱에서 연결 테스트용
+        key = request.args.get('key') or request.headers.get('X-Webhook-Key', '')
+        if key != _get_or_create_webhook_key():
+            return jsonify({'success': False, 'error': 'invalid key'}), 403
+        return jsonify({'success': True, 'message': '입금 웹훅 연결 정상! 이 URL과 키를 MacroDroid에 설정하세요.'})
+
+    key = request.args.get('key') or request.headers.get('X-Webhook-Key', '')
+    if key != _get_or_create_webhook_key():
+        logger.warning(f"[WEBHOOK] 인증 실패한 입금 웹훅 호출 차단 (IP: {request.remote_addr})")
+        return jsonify({'success': False, 'error': 'invalid key'}), 403
+
+    data = request.get_json(silent=True) or {}
+    title = str(data.get('title') or data.get('titleText') or '')
+    body = str(data.get('body') or data.get('text') or data.get('message') or data.get('content') or '')
+    package = str(data.get('package') or data.get('package_name') or data.get('app') or data.get('pkg') or '')
+
+    # JSON이 아니라 raw 텍스트로 보내는 경우도 허용
+    if not body and not title:
+        body = request.get_data(as_text=True) or ''
+    if not body and not title:
+        return jsonify({'success': False, 'error': 'empty notification'}), 400
+
+    logger.info(f"[WEBHOOK] 폰 알림 수신: pkg={package}, title={title[:60]}, body={body[:80]}")
+    try:
+        ok = pushbullet_monitor._process_incoming_push(package, title, body)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] 입금 처리 오류: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify({'success': True, 'deposit_detected': bool(ok)})
+
 
 # --- Stats ---
 @app.route('/api/stats', methods=['GET'])

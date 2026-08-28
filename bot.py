@@ -68,16 +68,95 @@ class VendingBot(commands.Bot):
             await asyncio.sleep(300)  # 5분
     
     async def on_message(self, message):
-        """메시지 처리 - 리뷰는 임베드 버튼(모달)으로만 작성"""
+        """메시지 처리 - 리뷰는 임베드 버튼(모달)로만 작성 + DM 입금 증거 스크린샷 접수"""
         if message.author.bot:
             return
-        
+
+        # DM에서 이미지 첨부가 오면 = 입금 증거 스크린샷으로 처리
+        if isinstance(message.channel, discord.DMChannel) and message.attachments:
+            await self.handle_charge_receipt_dm(message)
+            return
+
         # 일반 메시지 처리 (DM 포함 - 일반 채팅은 리뷰로 등록하지 않음)
         await self.process_commands(message)
-    
-    async def post_review(self, user, order_id, product_name, rating, content):
-        """리뷰를 리뷰 채널에 임베드로 게시"""
+
+    async def get_charge_log_channel(self):
+        """충전로그 채널 반환 (설정 키: charge_log_channel_id → 없으면 deposit_log_channel_id → admin_channel_id)"""
+        cid = (db.get_setting('charge_log_channel_id', '')
+               or db.get_setting('deposit_log_channel_id', '')
+               or db.get_setting('admin_channel_id', ''))
+        if not cid:
+            return None, "충전로그 채널이 설정되지 않았습니다.\n대시보드 설정에서 **충전로그 채널 ID**를 저장하세요."
         try:
+            channel = self.get_channel(int(cid))
+            if not channel:
+                channel = await self.fetch_channel(int(cid))
+            return channel, None
+        except Exception as e:
+            return None, f"충전로그 채널을 찾을 수 없습니다: {e}"
+
+    async def handle_charge_receipt_dm(self, message):
+        """유저가 DM으로 보낸 입금 증거 스크린샷을 충전로그에 등록하고 관리자에게 알림"""
+        # 대기 중인 충전 요청 확인
+        pending = db.get_pending_charge_requests_by_user(message.author.id)
+        if not pending:
+            await message.channel.send(
+                "⚠️ 대기 중인 충전 신청이 없습니다.\n"
+                "자판기에서 **💰 충전** → **💳 충전 신청**을 먼저 진행해주세요!"
+            )
+            return
+
+        req = pending[0]  # 가장 오래된 대기 요청
+        if req['receipt_image_url']:
+            await message.channel.send("⚠️ 이 충전 신청에는 이미 입금 증거가 접수되어 관리자 확인 중입니다.")
+            return
+
+        # 첨부 이미지가 실제 이미지인지 확인
+        attachment = message.attachments[0]
+        if not (attachment.content_type or '').startswith('image/'):
+            await message.channel.send("⚠️ 이미지 파일(스크린샷)로 보내주세요!")
+            return
+
+        # 증거 이미지 URL 저장
+        db.set_charge_receipt_image(req['id'], attachment.url)
+        await message.channel.send("✅ 입금 증거 스크린샷이 접수되었습니다! 관리자가 확인 후 승인하면 자동으로 포인트가 충전됩니다 👍")
+
+        # 충전로그 채널에 게시
+        channel, err = await self.get_charge_log_channel()
+        if not channel:
+            logger.error(f"[충전로그] {err}")
+            return
+
+        # 관리자 멘션 만들기
+        admins = db.get_admins()
+        mention_text = " ".join(f"<@{a['user_id']}>" for a in admins) if admins else "@관리자"
+
+        embed = discord.Embed(
+            title="💰 충전 승인 요청",
+            description=f"**{req['username']}** 님의 충전 신청입니다.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="🧾 요청번호", value=f"#{req['id']}", inline=True)
+        embed.add_field(name="입금자명", value=req['depositor_name'], inline=True)
+        embed.add_field(name="충전 금액", value=f"{req['amount']:,}원 → {req['amount']:,}포인트", inline=True)
+        embed.add_field(name="⏰ 신청일", value=req['created_at'], inline=False)
+        embed.set_image(url=attachment.url)
+        embed.set_footer(text="아래 버튼으로 승인/거절해주세요")
+
+        view = ChargeApproveView(req['id'])
+        await channel.send(content=f"{mention_text} 🔔 충전 승인 대기!", embed=embed, view=view)
+        logger.info(f"[충전로그] #{req['id']} 증거 스크린샷 게시 + 관리자 멘션")
+
+    async def post_review(self, user, order_id, product_name, rating, content):
+        """리뷰를 리뷰 채널에 임베드로 게시 (구매당 1개만 작성 가능)"""
+        try:
+            # 구매당 1개 제한: 해당 주문이 이미 후기를 작성했는지 확인
+            reviewed = db.order_is_reviewed(order_id)
+            if reviewed is None:
+                return False, "주문 정보를 찾을 수 없습니다."
+            if reviewed:
+                return False, "이 구매건은 이미 후기를 작성하셨습니다.\n후기는 구매당 1개만 작성 가능합니다 😊"
+
             review_channel_id = db.get_setting('review_channel_id', '')
             if not review_channel_id:
                 return False, "리뷰 채널이 설정되지 않았습니다. 관리자에게 문의해주세요."
@@ -106,6 +185,9 @@ class VendingBot(commands.Bot):
             embed.set_footer(text="냥코 KEY 자판기 🐱 | 구매 후기")
             
             await review_channel.send(embed=embed)
+            
+            # 후기 작성 완료 처리 (구매당 1개 제한)
+            db.mark_order_reviewed(order_id)
             
             logger.info(f"Review registered from {user} for order #{order_id} ({rating} stars)")
             return True, "후기가 등록되었습니다!"
@@ -846,6 +928,83 @@ class ReviewRequestView(discord.ui.View):
         self.add_item(ReviewButton(order_id, product_name))
 
 
+class ChargeApproveView(discord.ui.View):
+    """충전로그에서 관리자가 승인/거절하는 버튼 뷰"""
+    def __init__(self, charge_id):
+        super().__init__(timeout=None)
+        self.charge_id = charge_id
+
+    @discord.ui.button(label="✅ 승인", style=discord.ButtonStyle.success, custom_id="charge_approve_btn")
+    async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, approve=True)
+
+    @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger, custom_id="charge_reject_btn")
+    async def reject_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._decide(interaction, approve=False)
+
+    async def _decide(self, interaction: discord.Interaction, approve: bool):
+        # 관리자 권한 확인
+        if not db.is_admin(str(interaction.user.id)):
+            await interaction.response.send_message("❌ 관리자만 처리할 수 있습니다.", ephemeral=True)
+            return
+
+        req = db.get_charge_request(self.charge_id)
+        if not req:
+            await interaction.response.send_message("❌ 충전 요청을 찾을 수 없습니다.", ephemeral=True)
+            return
+        if req['status'] != 'pending':
+            await interaction.response.send_message(f"⚠️ 이미 처리된 요청입니다. (상태: {req['status']})", ephemeral=True)
+            return
+
+        if approve:
+            # 포인트 지급 + 완료 처리
+            new_balance = db.add_balance(
+                req['user_id'], req['username'], req['amount'],
+                trans_type='charge',
+                description=f"수동 승인 충전 ({req['depositor_name']}, {req['amount']:,}원)"
+            )
+            db.complete_charge_request(req['id'])
+            result_text = f"✅ **승인 완료!** {req['username']} 님에게 {req['amount']:,}포인트가 지급되었습니다."
+        else:
+            db.cancel_charge_request(req['id'])
+            result_text = f"❌ **거절되었습니다.** 요청 #{req['id']} 을(를) 취소했습니다."
+        # 결정자 기록
+        try:
+            import sqlite3
+            conn = db.get_conn()
+            c = conn.cursor()
+            c.execute("UPDATE charge_requests SET decided_by=? WHERE id=?",
+                      (str(interaction.user.id), self.charge_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        # 버튼 비활성화 + 결과 표시
+        for _btn in self.children:
+            _btn.disabled = True
+        await interaction.response.edit_message(content=result_text, view=self)
+
+        # 유저에게 DM 알림
+        try:
+            if approve:
+                embed = discord.Embed(
+                    title="✅ 충전 승인 완료!",
+                    description=f"{req['amount']:,}포인트가 충전되었습니다.",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
+            else:
+                embed = discord.Embed(
+                    title="❌ 충전이 거절되었습니다",
+                    description=f"{req['amount']:,}포인트 충전 요청이 거절되었습니다.",
+                    color=discord.Color.red()
+                )
+            await interaction.client.send_dm(req['user_id'], embed=embed)
+        except Exception as e:
+            logger.error(f"[충전승인] DM 알림 실패: {e}")
+
+        logger.info(f"[충전로그] #{self.charge_id} {'승인' if approve else '거절'} (관리자: {interaction.user})")
 class ReviewButton(discord.ui.Button):
     def __init__(self, order_id, product_name):
         super().__init__(
@@ -858,6 +1017,14 @@ class ReviewButton(discord.ui.Button):
         self.product_name = product_name
     
     async def callback(self, interaction: discord.Interaction):
+        # 구매당 1개 제한: 이미 후기 작성한 주문이면 버튼 안내
+        reviewed = db.order_is_reviewed(self.order_id)
+        if reviewed is None:
+            await interaction.response.send_message("❌ 주문 정보를 찾을 수 없습니다.", ephemeral=True)
+            return
+        if reviewed:
+            await interaction.response.send_message("⚠️ 이 구매건은 이미 후기를 작성하셨습니다.\n후기는 구매당 1개만 작성 가능합니다 😊", ephemeral=True)
+            return
         await interaction.response.send_modal(ReviewModal(self.order_id, self.product_name))
 
 
@@ -980,10 +1147,30 @@ class ChargeRequestModal(discord.ui.Modal):
         embed.add_field(name="입금자명", value=depositor_name, inline=True)
         embed.add_field(name="충전 금액", value=f"{amount:,}원 → {amount:,}포인트", inline=True)
         embed.add_field(name="🏦 입금 계좌", value=f"{bank_name} {bank_account} ({bank_holder})", inline=False)
-        embed.add_field(name="📌 안내", value="해당 계좌로 입금하시면 자동으로 확인되어 포인트가 충전됩니다!\n\n⏰ **충전 요청은 5분 뒤 만료됩니다.**\n5분 내에 입금되지 않으면 다시 충전 신청해주세요!", inline=False)
-        embed.set_footer(text="냥코 KEY 자판기 🐱")
-        
+        embed.add_field(name="📌 안내", value=f"아래 **입금 후 입금 확인 화면(스크린샷)을 이 DM으로 보내주세요!**\n\n입금하신 뒤 **{bank_account} ({bank_holder})** 로 송금 완료 화면을 캡처해서 이 DM에 사진으로 보내시면 관리자가 확인 후 승인해드립니다.\n\n⏰ **충전 요청은 5분 뒤 만료됩니다.** 5분 내에 스크린샷을 보내주세요!", inline=False)
+        embed.set_footer(text="냥코 KEY 자판기 🐱 | 증거 스크린샷 접수 후 관리자 승인")
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # 유저 DM으로 증거 스크린샷 안내 전송 (필수 증빙)
+        try:
+            user = interaction.user
+            dm_embed = discord.Embed(
+                title="💰 입금 증거 스크린샷을 보내주세요!",
+                description=(
+                    f"**{bank_name} {bank_account} ({bank_holder})** 계좌로 입금하신 뒤,\n"
+                    f"**입금 완료 화면(송금 내역 스크린샷)**을 아래 **'봇의 DM에 사진 첨부'**로 보내주세요!\n\n"
+                    f"확인 후 관리자가 수동으로 승인하면 포인트가 충전됩니다."
+                ),
+                color=discord.Color.blue()
+            )
+            dm_embed.add_field(name="🧾 요청번호", value=f"#{rid}", inline=True)
+            dm_embed.add_field(name="입금자명", value=depositor_name, inline=True)
+            dm_embed.add_field(name="충전 금액", value=f"{amount:,}원 → {amount:,}포인트", inline=True)
+            dm_embed.add_field(name="📌 방법", value="1️⃣ 송금 완료 후 **화면 캡처**\n2️⃣ 이 DM에 **사진(이미지)**을 첨부해서 전송\n3️⃣ 관리자 승인 대기", inline=False)
+            await user.send(embed=dm_embed)
+        except Exception as e:
+            logger.error(f"[충전] 증거 안내 DM 전송 실패 (유저 {interaction.user.id}): {e}")
 
 
 class BuyProductView(discord.ui.View):

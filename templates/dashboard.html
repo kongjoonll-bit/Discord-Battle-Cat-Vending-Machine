@@ -763,6 +763,10 @@
                     <input type="text" id="set-deposit-log-channel" value="{{ settings.get('deposit_log_channel_id', '') }}" placeholder="입금 로그를 보낼 Discord 채널 ID">
                 </div>
                 <div class="form-group">
+                    <label>충전 로그 채널 ID (수동 승인용)</label>
+                    <input type="text" id="set-charge-log-channel" value="{{ settings.get('charge_log_channel_id', '') }}" placeholder="입금 증거 스크린샷 + 승인/거절 버튼이 올라갈 채널 ID">
+                </div>
+                <div class="form-group">
                     <label>입고 알림 채널 ID</label>
                     <input type="text" id="set-stock-channel" value="{{ settings.get('stock_channel_id', '') }}" placeholder="재고 입고 시 공지를 보낼 Discord 채널 ID">
                 </div>

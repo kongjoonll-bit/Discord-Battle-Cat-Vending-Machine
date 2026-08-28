@@ -33,3 +33,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+# PB ·Î±×
+pushbullet_log.txt
+start_visible.bat
+test_e2e_charge.py
+test_webhook_charge.py

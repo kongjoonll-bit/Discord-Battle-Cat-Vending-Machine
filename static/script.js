@@ -383,6 +383,7 @@ async function saveSettings() {
         admin_channel_id: document.getElementById('set-admin-channel').value,
         purchase_log_channel_id: document.getElementById('set-purchase-log-channel').value,
         deposit_log_channel_id: document.getElementById('set-deposit-log-channel').value,
+        charge_log_channel_id: document.getElementById('set-charge-log-channel').value,
         stock_channel_id: document.getElementById('set-stock-channel').value,
         notice_channel_id: document.getElementById('set-notice-channel').value,
         purchase_role_id: document.getElementById('set-purchase-role').value,

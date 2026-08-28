@@ -200,23 +200,96 @@ class PushbulletMonitor:
         "com.kakaobank.channel",
         "com.samsung.android.messaging",
     )
+    # 패키지명 부분 일치 키워드 (토스뱅크 등 모든 은행 앱 대응)
+    BANK_PACKAGE_KEYWORDS = (
+        "ibk", "nh.mobilenoti", "wooribank", "kakaobank",
+        "samsung.android.messaging", "toss", "shinhan", "kbstar",
+        "hana", "kftc", "imbank", "citybank", "citi",
+    )
     KAKAO_BUFFER_WINDOW_SECONDS = 10
+
+    # 입금자명 후보에서 제외할 단어
+    NAME_SKIP_EXACT = (
+        "입금", "출금", "이체", "충전", "통장", "계좌", "농협", "우리", "카카오",
+        "토스", "뱅크", "은행", "잔액", "슈퍼챗", "후원", "송금", "확인", "완료",
+        "결제", "거부", "취소", "아이", "미성년", "공동",
+    )
+    NAME_SKIP_CONTAIN = (
+        "뱅크", "은행", "통장", "잔액", "입금", "출금", "이체", "충전",
+        "계좌", "카카오", "토스", "결제", "이자",
+    )
+
+    def _is_bank_package(self, package_name):
+        """은행(또는 문자) 앱 패키지명인지 판별 (부분 일치)"""
+        if not package_name:
+            return False
+        p = str(package_name).lower()
+        return any(k in p for k in self.BANK_PACKAGE_KEYWORDS)
+
+    def _is_name_blocked(self, cand):
+        """입금자명 후보가 제외 대상인지 판별"""
+        if not cand:
+            return True
+        if cand in self.NAME_SKIP_EXACT:
+            return True
+        if any(k in cand for k in self.NAME_SKIP_CONTAIN):
+            return True
+        if re.search(r"\d", cand):
+            return True
+        return False
+
+    def _find_depositor_name(self, text):
+        """알림 텍스트에서 입금자명 후보를 찾습니다.
+
+        우선순위:
+        1. "입금 공예준" / "입금자: 공예준" 형식 (토스뱅크 등)
+        2. "공예준 →" 화살표 앞 이름 (카카오뱅크 등)
+        3. 텍스트 내 모든 한글 2~4자 후보 순회 (제외 단어 필터링)
+        """
+        # 1) "입금 <이름>" 형식 - 토스뱅크: "1,000원 입금 공예준 → 내 토스뱅크..."
+        m = re.search(r"입금(?:자명|자)?\s*[:：]?\s*([가-힣]{2,4}|[A-Za-z0-9]{2,20})", text)
+        if m:
+            cand = m.group(1).strip()
+            if not self._is_name_blocked(cand):
+                return cand
+        # 2) 화살표 앞 이름: "공예준 → 내 ...통장"
+        for m in re.finditer(r"([가-힣]{2,4})\s*→", text):
+            cand = m.group(1).strip()
+            if not self._is_name_blocked(cand):
+                return cand
+        # 3) 모든 한글 후보 순회
+        for m in re.finditer(r"[가-힣]{2,6}", text):
+            cand = m.group(0)
+            if 2 <= len(cand) <= 4 and not self._is_name_blocked(cand):
+                return cand
+        return ""
 
     def _process_incoming_push(self, package_name, title, body):
         """모든 푸시 이벤트 통합 처리 (WebSocket/폴링 공용 진입점)"""
         combined_text = f"{title} {body}" if title else body
-        if package_name and package_name not in self.BANK_PACKAGES and "입금" not in combined_text:
+        is_bank = self._is_bank_package(package_name)
+        has_deposit_word = "입금" in combined_text
+        if package_name and not is_bank and not has_deposit_word:
             return False
         depositor, amount = self._extract_from_push(package_name, title, body)
         full_text = f"{title} {body}"
         if not depositor or not amount or amount <= 0:
+            # 은행 알림인데 파싱에 실패하면 반드시 기록한다.
+            # (조용히 버려지면 "충전이 안 된다"는 사고의 원인을 알 수 없음)
+            if is_bank or has_deposit_word:
+                logger.warning(f"⚠️ 입금 파싱 실패(버림): pkg={package_name}, text={full_text[:100]}")
+                self._log_to_file(f"⚠️ 입금 파싱 실패(버림): pkg={package_name}, text={full_text[:100]}")
             return False
         logger.info(f"💰 [실시간 입금 알림] 금액: {amount}원, 입금자: {depositor}")
         self._log_to_file(f"✅ 입금 감지 완료: {depositor}, {amount}원 (pkg={package_name})")
-        if self._is_duplicate(f"{package_name}|{depositor}|{amount}"):
+        if self._is_duplicate(f"{package_name}|{full_text}"):
             return True
         if self.on_deposit_detected:
-            self.on_deposit_detected(amount, full_text, depositor)
+            try:
+                self.on_deposit_detected(amount, full_text, depositor)
+            except Exception as e:
+                logger.error(f"[PB처리] 입금 콜백 오류: {e}")
+                self._log_to_file(f"❌ 입금 콜백 오류: {e}")
         return True
 
     def _extract_from_push(self, package_name, title="", body=""):
@@ -226,12 +299,16 @@ class PushbulletMonitor:
         return self.parse_generic_bank_notification(package_name, body)
 
     def parse_generic_bank_notification(self, package_name, body):
-        """IBK / 농협 / 우리은행 / 삼성 문자앱 / 범용 폴백 파싱"""
+        """IBK / 농협 / 우리은행 / 삼성 문자앱 / 토스뱅크 / 범용 폴백 파싱"""
         body_normalized = body.replace("\n", " ")
         message_parts = body_normalized.replace("원", "").replace(",", "").split(" ")
         displayname = ""
         count = 0
         try:
+            # 출금 알림 제외: "출금"만 있고 "입금"이 없으면 무조건 스킵
+            # (예: "1,000원 출금 내 토스뱅크 아이 통장 → 토스 공예준")
+            if "출금" in body_normalized and "입금" not in body_normalized:
+                return None, None
             if package_name == "com.IBK.SmartPush.app":
                 sp = body_normalized.split(" ")
                 if len(sp) >= 3:
@@ -260,16 +337,14 @@ class PushbulletMonitor:
                             displayname = p
                             break
             else:
-                amt_match = re.search(r"입금\s*([\d,]+)원", body)
-                if not amt_match:
-                    amt_match = re.search(r"([\d,]+)원\s*입금", body)
+                # 범용 폴백 (토스뱅크 포함): "1,000원 입금 공예준 → ..." 및 "입금 1,000원 ..." 형식
+                amt_match = (re.search(r"입금(?:자명|자)?\s*[:：]?\s*([\d,]+)\s*원", body_normalized)
+                             or re.search(r"입금\s*([\d,]+)\s*원", body_normalized)
+                             or re.search(r"([\d,]+)\s*원\s*입금", body_normalized)
+                             or re.search(r"([\d,]+)\s*원", body_normalized))
                 if amt_match:
                     count = int(amt_match.group(1).replace(",", ""))
-                    for ln in [ln.strip() for ln in body.splitlines() if ln.strip()]:
-                        if re.search(r"[가-힣]{2,4}", ln) and "원" not in ln and "잔액" not in ln:
-                            displayname = re.sub(r"[^가-힣]", "", ln)
-                            if 2 <= len(displayname) <= 4:
-                                break
+                displayname = self._find_depositor_name(body_normalized)
             if count > 0 and displayname:
                 return displayname, count
             return None, None
@@ -302,12 +377,20 @@ class PushbulletMonitor:
             if amt_match:
                 count = int(amt_match.group(1).replace(",", ""))
             if not displayname:
-                skip_words = ("입금", "출금", "이체", "충전", "통장", "계좌", "농협", "우리", "카카오")
-                name_pattern = re.search(r"([가-힣]{2,4})", all_bodies)
-                if name_pattern:
-                    potential_name = name_pattern.group(1)
-                    if not re.search(r"\d", potential_name) and "통장" not in potential_name and potential_name not in skip_words:
-                        displayname = potential_name
+                # 1) 화살표 앞 이름 우선 (comet.py 방식): "공예준 → 내 입출금통장"
+                arrow_match = re.search(r"([가-힣]{2,4})\s*→", all_bodies)
+                if arrow_match:
+                    cand = arrow_match.group(1).strip()
+                    if cand and not self._is_name_blocked(cand):
+                        displayname = cand
+            if not displayname:
+                # 2) 화살표 뒤 입출금통장 형식: "공예준 → 입출금통장"
+                name_match = re.search(r"([가-힣]{2,4})\s*→\s*입출금통장", all_bodies)
+                if name_match:
+                    displayname = name_match.group(1).strip()
+            if not displayname:
+                # 3) 모든 한글 후보 순회 (제외 단어 필터링)
+                displayname = self._find_depositor_name(all_bodies)
             if count > 0 and displayname:
                 return displayname, count
             self._log_to_file(f"⏳ 카카오뱅크 버퍼 대기 (입금자:{displayname or '없음'}, 금액:{count or 0})")
@@ -464,6 +547,13 @@ class PushbulletMonitor:
                 if self.last_processed_id and push_id == self.last_processed_id:
                     break
                 new_pushes.append(push)
+
+            # 첫 폴링에서는 과거 알림을 재생하지 않는다 (서버 재시작 시
+            # 오래된 입금 알림이 대기 중인 충전 요청에 잘못 매칭되는 사고 방지)
+            if self.last_processed_id is None and pushes:
+                self.last_processed_id = pushes[0].get('iden')
+                logger.info(f"[PB폴링] 첫 실행 - 기존 알림 {len(pushes)}건 건너뜀 (재생 방지)")
+                return
 
             for push in reversed(new_pushes):
                 push_id = push.get('iden')

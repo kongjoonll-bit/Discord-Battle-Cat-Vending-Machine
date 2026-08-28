@@ -61,10 +61,17 @@ def init_db():
         amount INTEGER NOT NULL,
         status TEXT DEFAULT 'pending',  -- pending, confirmed, cancelled, completed
         key_id INTEGER DEFAULT NULL,
+        reviewed INTEGER DEFAULT 0,  -- 후기 작성 여부 (구매당 1개 제한)
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         confirmed_at TEXT DEFAULT NULL,
         FOREIGN KEY (product_id) REFERENCES products(id)
     )''')
+
+    # 기존 DB 마이그레이션: 후기 작성 여부 컬럼 보장
+    try:
+        c.execute("ALTER TABLE orders ADD COLUMN reviewed INTEGER DEFAULT 0")
+    except Exception:
+        pass  # 이미 존재
     
     # Admins table
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
@@ -98,9 +105,18 @@ def init_db():
         depositor_name TEXT NOT NULL,
         amount INTEGER NOT NULL,
         status TEXT DEFAULT 'pending',  -- pending, completed, cancelled
+        receipt_image_url TEXT DEFAULT '',  -- 수동 승인용 입금 스크린샷 첨부 이미지 URL
+        decided_by TEXT DEFAULT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         completed_at TEXT DEFAULT NULL
     )''')
+
+    # 기존 DB 마이그레이션: 증거이미지/결정자 컬럼 보장
+    for _col in ('receipt_image_url TEXT DEFAULT \'\'', 'decided_by TEXT'):
+        try:
+            c.execute(f'ALTER TABLE charge_requests ADD COLUMN {_col}')
+        except Exception:
+            pass  # 이미 존재
     
     # Tickets table (for inquiry/support system)
     c.execute('''CREATE TABLE IF NOT EXISTS tickets (
@@ -297,6 +313,21 @@ def get_order(oid):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
+
+def order_is_reviewed(oid):
+    """해당 주문의 후기 작성 여부 확인 (1이면 이미 작성함)"""
+    row = get_order(oid)
+    if not row:
+        return None
+    return bool(row.get('reviewed', 0))
+
+def mark_order_reviewed(oid):
+    """해당 주문에 리뷰가 작성되었음을 기록"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE orders SET reviewed=1 WHERE id=?", (oid,))
+    conn.commit()
+    conn.close()
 
 def get_orders(status=None, user_id=None, limit=100):
     conn = get_conn()
@@ -560,6 +591,24 @@ def cancel_charge_request(rid):
     c.execute('UPDATE charge_requests SET status=? WHERE id=?', ('cancelled', rid))
     conn.commit()
     conn.close()
+
+def set_charge_receipt_image(rid, image_url):
+    """충전 요청에 입금 증거 스크린샷 이미지 URL 저장"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE charge_requests SET receipt_image_url=? WHERE id=?', (image_url, rid))
+    conn.commit()
+    conn.close()
+
+def get_pending_charge_requests_by_user(user_id):
+    """특정 유저의 대기 중인 충전 요청 (가장 오래된 것 우선, 최대 5개)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM charge_requests WHERE user_id=? AND status=? ORDER BY id ASC LIMIT 5',
+              (str(user_id), 'pending'))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 def get_user_charge_requests(user_id, limit=10):
     """Get charge requests for a user"""
