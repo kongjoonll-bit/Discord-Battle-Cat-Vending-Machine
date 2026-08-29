@@ -336,11 +336,19 @@ def dashboard():
     total_revenue = db.get_total_revenue()
     products = db.get_products()
     pending_orders = db.get_pending_orders()
+    # 웹훅 키 보장 (없으면 생성) - 설정 화면에서 항상 확인 가능하게
+    webhook_key = _get_or_create_webhook_key()
     settings = db.get_all_settings()
-    
+
+    # 웹훅 전체 URL 만들기: 대시보드 URL → Render 외부 URL → 로컬 순
+    _base = (settings.get('dashboard_url', '')
+             or os.environ.get('RENDER_EXTERNAL_URL', '')
+             or f"http://localhost:{os.environ.get('PORT', '5001')}").rstrip('/')
+    webhook_full_url = f"{_base}/api/deposit-webhook?key={webhook_key}"
+
     # Bot status
     bot_status = 'online' if bot.is_ready() else 'offline'
-    
+
     return render_template('dashboard.html',
         stats=stats,
         total_revenue=total_revenue,
@@ -348,7 +356,8 @@ def dashboard():
         pending_orders=pending_orders,
         settings=settings,
         bot_status=bot_status,
-        bot_name=settings.get('bot_name', '냥코 KEY 자판기')
+        bot_name=settings.get('bot_name', '냥코 KEY 자판기'),
+        webhook_full_url=webhook_full_url
     )
 
 # ============ API ROUTES ============
