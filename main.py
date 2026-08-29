@@ -704,7 +704,8 @@ def api_deposit_webhook():
         logger.warning(f"[WEBHOOK] 인증 실패한 입금 웹훅 호출 차단 (IP: {request.remote_addr})")
         return jsonify({'success': False, 'error': 'invalid key'}), 403
 
-    data = request.get_json(silent=True) or {}
+    # JSON 파싱 (Content-Type 헤더 없이 보내도 강제로 JSON 파싱 - Tasker 설정 단순화)
+    data = request.get_json(silent=True, force=True) or {}
     title = str(data.get('title') or data.get('titleText') or '')
     body = str(data.get('body') or data.get('text') or data.get('message') or data.get('content') or '')
     package = str(data.get('package') or data.get('package_name') or data.get('app') or data.get('pkg') or '')
