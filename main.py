@@ -673,16 +673,26 @@ def api_pushbullet_status():
 DEPOSIT_WEBHOOK_SETTING_KEY = 'deposit_webhook_key'
 
 def _get_or_create_webhook_key():
-    """입금 웹훅 인증 키 조회 (없으면 환경변수 또는 자동 생성해서 DB에 저장)"""
+    """입금 웹훅 인증 키 조회.
+
+    우선순위: 환경변수(DEPOSIT_WEBHOOK_KEY) > DB 저장값 > 자동 생성.
+    환경변수를 지정하면 DB 값과 무관하게 항상 그 키를 사용한다.
+    """
+    env_key = os.environ.get('DEPOSIT_WEBHOOK_KEY', '').strip()
+    if env_key:
+        # 환경변수가 있으면 그 값과 DB를 동기화 (Render 재배포 후에도 안전)
+        if db.get_setting(DEPOSIT_WEBHOOK_SETTING_KEY, '') != env_key:
+            db.set_setting(DEPOSIT_WEBHOOK_SETTING_KEY, env_key)
+        return env_key
+
     saved = db.get_setting(DEPOSIT_WEBHOOK_SETTING_KEY, '')
     if saved:
         return saved
-    saved = os.environ.get('DEPOSIT_WEBHOOK_KEY', '')
-    if not saved:
-        saved = secrets.token_hex(16)
-    db.set_setting(DEPOSIT_WEBHOOK_SETTING_KEY, saved)
-    logger.info(f"[WEBHOOK] 입금 웹훅 인증 키 생성됨: {saved}")
-    return saved
+
+    new_key = secrets.token_hex(16)
+    db.set_setting(DEPOSIT_WEBHOOK_SETTING_KEY, new_key)
+    logger.info(f"[WEBHOOK] 입금 웹훅 인증 키 자동 생성됨: {new_key}")
+    return new_key
 
 @app.route('/api/deposit-webhook', methods=['GET', 'POST'])
 def api_deposit_webhook():
