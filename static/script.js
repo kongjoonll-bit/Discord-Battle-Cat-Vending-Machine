@@ -15,7 +15,7 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
         if (tab === 'users') loadUsers();
         if (tab === 'coupons') loadCoupons();
         if (tab === 'admins') loadAdmins();
-        if (tab === 'settings') loadWebhookLogs();
+        if (tab === 'depositlog') loadWebhookLogs();
     });
 });
 
@@ -468,6 +468,25 @@ async function loadWebhookLogs() {
         }).join('');
     } catch (e) {
         container.innerHTML = '<div style="color:#e74c3c;">로그 로드 실패: ' + e + '</div>';
+    }
+}
+
+async function clearWebhookLogs() {
+    if (!confirm('웹훅 수신 로그를 모두 삭제하시겠습니까?')) return;
+    try {
+        const resp = await fetch('/api/deposit-webhook/logs/clear', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            const container = document.getElementById('webhook-logs-container');
+            if (container) {
+                container.innerHTML = '<div style="color:#888;">로그가 삭제되었습니다.</div>';
+            }
+            showToast('로그가 삭제되었습니다.', 'success');
+        } else {
+            showToast('로그 삭제 실패', 'error');
+        }
+    } catch (e) {
+        showToast('로그 삭제 실패', 'error');
     }
 }
 

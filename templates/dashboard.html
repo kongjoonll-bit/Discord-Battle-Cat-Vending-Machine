@@ -465,6 +465,7 @@
             <a href="#" data-tab="users"><i class="fas fa-users"></i><span>유저 관리</span></a>
             <a href="#" data-tab="coupons"><i class="fas fa-ticket"></i><span>쿠폰 관리</span></a>
             <a href="#" data-tab="notice"><i class="fas fa-bullhorn"></i><span>공지 보내기</span></a>
+            <a href="#" data-tab="depositlog"><i class="fas fa-history"></i><span>입금 로그</span></a>
             <a href="#" data-tab="settings"><i class="fas fa-cog"></i><span>설정</span></a>
             <a href="#" data-tab="admins"><i class="fas fa-user-shield"></i><span>관리자</span></a>
         </nav>
@@ -813,21 +814,6 @@
                     <small style="opacity:.7;display:block;margin-top:4px">충전 신청 후 이 시간이 지나면 요청이 만료되어 자동 충전되지 않습니다. (기본 30분)</small>
                 </div>
                 <div class="form-group">
-                    <label>🧪 웹훅 테스트 — 실제 은행 알림 문구를 넣어 파싱/매칭을 미리 확인하세요</label>
-                    <input type="text" id="webhook-test-text" placeholder="예: 5,000원 입금 홍길동 → 내 토스뱅크 아이 통장">
-                    <button class="btn btn-primary btn-sm" onclick="testDepositWebhook()" style="margin-top:8px;">
-                        <i class="fas fa-vial"></i> 테스트 실행
-                    </button>
-                    <div id="webhook-test-result" style="margin-top:8px;"></div>
-                </div>
-                <div class="form-group">
-                    <label>📜 최근 웹훅 수신 로그 (Tasker → 서버 도달 여부 진단)</label>
-                    <button class="btn btn-sm" onclick="loadWebhookLogs()" style="margin:6px 0;">
-                        <i class="fas fa-sync"></i> 로그 새로고침
-                    </button>
-                    <div id="webhook-logs-container" style="max-height:220px;overflow-y:auto;background:rgba(0,0,0,.25);border-radius:8px;padding:10px;font-size:12px;font-family:monospace;"></div>
-                </div>
-                <div class="form-group">
                     <label>입고 알림 채널 ID</label>
                     <input type="text" id="set-stock-channel" value="{{ settings.get('stock_channel_id', '') }}" placeholder="재고 입고 시 공지를 보낼 Discord 채널 ID">
                 </div>
@@ -873,10 +859,48 @@
                     <i class="fas fa-save"></i> 계좌 설정 저장
                 </button>
             </div>
-            
+        </div>
+        
+        <!-- 입금 로그 Tab (Tasker 자동입금 확인 진단) -->
+        <div class="tab-content" id="tab-depositlog">
+            <div class="card">
+                <h3><i class="fas fa-history"></i> 입금 웹훅 수신 로그
+                    <small style="font-weight:400;color:#888;font-size:12px;margin-left:8px;">Tasker → 서버 수신/처리 기록 (최근 50건)</small>
+                </h3>
+                <div style="display:flex;gap:8px;margin-bottom:10px;">
+                    <button class="btn btn-primary btn-sm" onclick="loadWebhookLogs()">
+                        <i class="fas fa-sync"></i> 새로고침
+                    </button>
+                    <button class="btn btn-danger btn-sm" onclick="clearWebhookLogs()">
+                        <i class="fas fa-trash"></i> 전체 삭제
+                    </button>
+                </div>
+                <div id="webhook-logs-container" style="max-height:420px;overflow-y:auto;background:rgba(0,0,0,.25);border-radius:8px;padding:12px;font-size:12px;font-family:monospace;"></div>
+                <small style="opacity:.6;display:block;margin-top:8px;">💡 로그에 <b style="color:#e74c3c;">%ntitle / %ntext</b> 가 보이면 Tasker 변수가 치환되지 않은 것 → 아래 Tasker 설정 안내를 확인하세요.</small>
+            </div>
+            <div class="card">
+                <h3><i class="fas fa-vial"></i> 웹훅 테스트 — 실제 토스 알림 문구로 파싱/매칭 확인</h3>
+                <div class="form-group">
+                    <input type="text" id="webhook-test-text" placeholder="예: 5,000원 입금 홍길동 → 내 토스뱅크 아이 통장">
+                    <button class="btn btn-primary btn-sm" onclick="testDepositWebhook()" style="margin-top:8px;">
+                        <i class="fas fa-vial"></i> 테스트 실행
+                    </button>
+                    <div id="webhook-test-result" style="margin-top:8px;"></div>
+                </div>
+            </div>
             <div class="card">
                 <h3><i class="fas fa-mobile-alt"></i> Tasker(폰) 설정 안내</h3>
-                <p style="color: #888; margin-bottom: 15px;">1️⃣ 위의 <b>입금 자동감지 웹훅 URL</b>을 복사 → 2️⃣ 폰 Tasker에서 <b>Event &gt; UI &gt; Notification</b> 프로필 생성 (앱: 토스) → 3️⃣ 작업에 <b>HTTP Request(POST)</b> 추가, Body: {"title":"%evtprm1","body":"%evtprm2","package":"%evtprm3"} → 4️⃣ 토스 입금 알림 발생 시 아래 <b>최근 웹훅 수신 로그</b>에 기록되는지 확인</p>
+                <p style="color:#888;margin-bottom:10px;">⚠️ 로그에 <b>%ntitle / %ntext</b> 가 그대로 보이면 Tasker 변수를 잘못 사용한 것입니다. 아래처럼 <b>%evtprm1 / %evtprm2 / %evtprm3</b> 을 사용하세요.</p>
+                <ol style="margin-left:20px;line-height:2;color:#ddd;">
+                    <li>대시보드 <b>설정 탭</b> → <b>📲 입금 자동감지 웹훅 URL</b> 복사</li>
+                    <li>Tasker: <b>+ → Event → UI → Notification</b> → 앱 <b>토스</b> 선택, 알림 접근 허용</li>
+                    <li>작업: <b>+ → Net → HTTP Request</b></li>
+                    <li>Method: <b>POST</b> / URL: 복사한 웹훅 URL</li>
+                    <li>Headers: <b>Content-Type: application/json</b></li>
+                    <li>Body(아래 그대로): <code>{"title":"%evtprm1","body":"%evtprm2","package":"%evtprm3"}</code></li>
+                    <li>저장 후 실제 토스 입금 → 이 탭에서 <b>새로고침</b> → 로그가 쌓이는지 확인</li>
+                </ol>
+                <p style="color:#888;margin-top:10px;">✅ 자동 충전 조건: ① 충전 신청 대기 ② 토스 알림 도착 ③ 금액+입금자명 일치 — 이 3가지가 모두 충족돼야 충전됩니다.</p>
             </div>
         </div>
         

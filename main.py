@@ -689,6 +689,21 @@ def _record_webhook_log(level, message):
 # 충전 요청 유효 시간 기본값 (분) - 설정키: charge_expire_minutes
 DEFAULT_CHARGE_EXPIRE_MINUTES = 30
 
+# Tasker 변수 패턴 (이 형식이 그대로 오면 변수 치환이 안 된 것)
+_TASKER_VAR_RE = re.compile(r'%[A-Za-z0-9_]+')
+
+def _detect_unresolved_tasker_vars(title, body):
+    """'%ntitle', '%ntext', '%evtprm1'처럼 Tasker 변수가 치환되지 않고 그대로 도착했는지 감지"""
+    found = []
+    for part in (title, body):
+        if not part:
+            continue
+        for m in _TASKER_VAR_RE.finditer(part):
+            v = m.group(0)
+            if v not in found:
+                found.append(v)
+    return found
+
 def _get_charge_expire_minutes():
     """충전 요청 유효 시간(분) 조회. 대시보드 설정에서 변경 가능 (1~1440분)"""
     try:
@@ -742,11 +757,15 @@ def api_deposit_webhook():
         _record_webhook_log('error', "❌ 인증 실패(키 불일치)! Tasker/MacroDroid에 저장된 URL이 오래되었습니다. 대시보드 설정의 웹훅 URL을 다시 복사해 넣으세요.")
         return jsonify({'success': False, 'error': 'invalid key'}), 403
 
-    # JSON 파싱 (Content-Type 헤더 없이 보내도 강제로 JSON 파싱 - Tasker 설정 단순화)
+    # JSON(form/query도 허용) 파싱 (Content-Type 헤더 없이 보내도 강제로 JSON 파싱 - Tasker 설정 단순화)
     data = request.get_json(silent=True, force=True) or {}
-    title = str(data.get('title') or data.get('titleText') or '')
-    body = str(data.get('body') or data.get('text') or data.get('message') or data.get('content') or '')
-    package = str(data.get('package') or data.get('package_name') or data.get('app') or data.get('pkg') or '')
+    title = str(data.get('title') or data.get('titleText')
+                or request.form.get('title') or request.args.get('title') or '')
+    body = str(data.get('body') or data.get('text') or data.get('message') or data.get('content')
+               or request.form.get('body') or request.form.get('text') or request.form.get('message')
+               or request.args.get('body') or request.args.get('text') or request.args.get('message') or '')
+    package = str(data.get('package') or data.get('package_name') or data.get('app') or data.get('pkg')
+                  or request.form.get('package') or request.args.get('package') or '')
 
     # JSON이 아니라 raw 텍스트로 보내는 경우도 허용
     if not body and not title:
@@ -756,6 +775,18 @@ def api_deposit_webhook():
 
     logger.info(f"[WEBHOOK] 폰 알림 수신: pkg={package}, title={title[:60]}, body={body[:80]}")
     _record_webhook_log('recv', f"수신: pkg={package or '없음'} | {title[:40]} | {body[:70]}")
+
+    # Tasker 변수가 치환되지 않고 그대로 도착한 경우 → 즉시 안내 (가장 흔한 원인)
+    unresolved = _detect_unresolved_tasker_vars(title, body)
+    if unresolved:
+        msg = ("❌ Tasker 변수가 그대로 전송됨: " + ", ".join(unresolved) +
+               " → 알림 내용이 아니라 변수 이름만 도착했습니다. "
+               "Tasker의 Notification 프로필 진입 변수는 %evtprm1(제목)/%evtprm2(내용)/%evtprm3(앱)을 사용하세요 (%ntitle/%ntext는 쓰지 마세요).")
+        _record_webhook_log('error', msg)
+        logger.warning(msg)
+        return jsonify({'success': False, 'error': 'tasker_var_not_substituted',
+                        'vars': unresolved, 'message': msg}), 200
+
     try:
         handled, depositor, amount = toss_monitor.process(title, body)
     except Exception as e:
@@ -765,7 +796,7 @@ def api_deposit_webhook():
     if handled:
         return jsonify({'success': True, 'deposit_detected': True,
                         'depositor': depositor, 'amount': amount})
-    _record_webhook_log('warn', "⚠️ 알림을 받았지만 입금으로 인식하지 못했습니다. (대시보드 '웹훅 테스트'로 확인)")
+    _record_webhook_log('warn', "⚠️ 알림을 받았지만 입금으로 인식하지 못했습니다. (대시보드 '입금 로그' 탭의 웹훅 테스트로 확인)")
     return jsonify({'success': True, 'deposit_detected': False})
 
 
@@ -779,6 +810,15 @@ def api_test_deposit_webhook():
     package = str(data.get('package') or '').strip()
     if not title and not body:
         return jsonify({'success': False, 'message': '제목 또는 내용을 입력해주세요.'}), 400
+
+    # 테스트 입력에 Tasker 변수가 그대로 오면 안내
+    unresolved = _detect_unresolved_tasker_vars(title, body)
+    if unresolved:
+        return jsonify({'success': False, 'message': (
+            "입력값에 Tasker 변수(" + ", ".join(unresolved) +
+            ")가 그대로 있습니다. 실제 토스 알림 문구를 입력해주세요. "
+            "(변수 문제가 아니라 '알림 내용'으로 테스트해야 합니다)"
+        )}), 200
 
     try:
         parsed = toss_monitor.test_parse(title, body)
@@ -845,6 +885,16 @@ def api_deposit_webhook_logs():
     with _webhook_log_lock:
         logs = list(_webhook_log)
     return jsonify({'success': True, 'logs': logs})
+
+
+@app.route('/api/deposit-webhook/logs/clear', methods=['POST'])
+@login_required
+def api_clear_deposit_webhook_logs():
+    """웹훅 수신 로그 전체 삭제"""
+    with _webhook_log_lock:
+        _webhook_log.clear()
+    logger.info("[WEBHOOK] 관리자가 웹훅 로그 전체 삭제 실행")
+    return jsonify({'success': True, 'message': '로그가 삭제되었습니다.'})
 
 
 # --- Stats ---
