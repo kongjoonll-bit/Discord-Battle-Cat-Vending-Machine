@@ -39,6 +39,10 @@ class VendingBot(commands.Bot):
         if not getattr(self, '_ping_task_started', False):
             self._ping_task_started = True
             self.loop.create_task(self.ping_loop())
+        # 자동 충전 리마인더 루프 시작 (중복 방지)
+        if not getattr(self, '_reminder_task_started', False):
+            self._reminder_task_started = True
+            self.loop.create_task(self.charge_reminder_loop())
     
     async def ping_loop(self):
         """5분마다 대시보드/자판기 핑 자동 전송 (비블로킹)"""
@@ -66,7 +70,77 @@ class VendingBot(commands.Bot):
             except Exception as e:
                 logger.error(f"[PING] Error: {e}")
             await asyncio.sleep(300)  # 5분
-    
+
+    async def charge_reminder_loop(self):
+        """30초마다 확인 - 충전 신청 후 3분이 지나도 자동 충전이 안 된 요청에 리마인더 DM 발송"""
+        logger.info("[충전리마인더] 루프 시작 (3분 무충전 시 DM 알림)")
+        while True:
+            try:
+                if self.is_ready():
+                    await self._process_charge_reminders()
+            except Exception as e:
+                logger.error(f"[충전리마인더] 루프 오류: {e}")
+            await asyncio.sleep(30)
+
+    async def _process_charge_reminders(self):
+        """3분 경과한 대기 충전 요청에 리마인더 DM 발송 (발송 완료 표시로 중복 방지)"""
+        # 유효 시간(만료 분) 가져오기 (대시보드 설정값, 기본 30분)
+        try:
+            expire_minutes = int(str(db.get_setting('charge_expire_minutes', '')).strip() or 30)
+        except (TypeError, ValueError):
+            expire_minutes = 30
+        expire_minutes = max(1, min(expire_minutes, 1440))
+
+        rows = db.get_charge_requests_needing_reminder(minutes=3, expire_minutes=expire_minutes)
+        if not rows:
+            return
+
+        for req in rows:
+            # 먼저 발송 표시 (DM 실패해도 무한 재시도 방지)
+            db.mark_charge_reminder_sent(req['id'])
+
+            # 발송 직전 상태 재확인 - 그 사이 자동 충전/취소됐으면 스킵
+            latest = db.get_charge_request(req['id'])
+            if not latest or latest['status'] != 'pending':
+                logger.info(f"[충전리마인더] #{req['id']} 이미 처리됨({latest['status'] if latest else '삭제됨'}) → 스킵")
+                continue
+
+            try:
+                user = await self.fetch_user(int(latest['user_id']))
+                if not user:
+                    logger.warning(f"[충전리마인더] #{latest['id']} 유저를 찾을 수 없음 ({latest['user_id']})")
+                    continue
+
+                bank_account = db.get_setting('bank_account', '미설정')
+                bank_holder = db.get_setting('bank_holder', '미설정')
+                bank_name = db.get_setting('bank_name', '')
+
+                embed = discord.Embed(
+                    title="⏰ 아직 자동 충전이 확인되지 않았어요!",
+                    description=(
+                        f"충전 신청 후 **3분**이 지났지만 자동 충전이 되지 않았습니다.\n\n"
+                        f"✅ **입금하셨다면**\n"
+                        f"📸 입금 완료 사진(스크린샷)을 **이 DM에 사진으로 보내주세요!**\n"
+                        f"관리자가 확인 후 승인하면 포인트가 충전됩니다.\n\n"
+                        f"💳 **아직 입금 전이라면**\n"
+                        f"**{bank_name} {bank_account} ({bank_holder})** 로 입금해주세요.\n"
+                        f"입금하면 토스 알림 감지 후 **자동으로 충전**됩니다!"
+                    ),
+                    color=discord.Color.orange()
+                )
+                embed.add_field(name="🧾 요청번호", value=f"#{latest['id']}", inline=True)
+                embed.add_field(name="입금자명", value=latest['depositor_name'], inline=True)
+                embed.add_field(name="충전 금액", value=f"{latest['amount']:,}원 → {latest['amount']:,}포인트", inline=True)
+                embed.add_field(name="⏰ 만료", value=f"이 요청은 신청 후 {expire_minutes}분 뒤 만료됩니다.", inline=False)
+                embed.set_footer(text="냥코 KEY 자판기 🐱")
+
+                await user.send(embed=embed)
+                logger.info(f"[충전리마인더] #{latest['id']} 리마인더 DM 발송 완료 ({latest['username']})")
+            except discord.Forbidden:
+                logger.warning(f"[충전리마인더] #{latest['id']} DM 차단으로 발송 실패 (유저: {latest['username']})")
+            except Exception as e:
+                logger.error(f"[충전리마인더] #{latest['id']} DM 발송 오류: {e}")
+
     async def on_message(self, message):
         """메시지 처리 - 리뷰는 임베드 버튼(모달)로만 작성 + DM 입금 증거 스크린샷 접수"""
         if message.author.bot:
@@ -97,6 +171,15 @@ class VendingBot(commands.Bot):
 
     async def handle_charge_receipt_dm(self, message):
         """유저가 DM으로 보낸 입금 증거 스크린샷을 충전로그에 등록하고 관리자에게 알림"""
+        # 이미 자동 충전이 완료된 경우 → 사진 접수 차단
+        recent = db.get_user_charge_requests(message.author.id, limit=1)
+        if recent and recent[0]['status'] == 'completed':
+            await message.channel.send(
+                "✅ **이미 자동 충전이 완료되었습니다!**\n"
+                "입금이 정상 확인되어 포인트가 지급되었으니 사진을 보내실 필요 없습니다 😊"
+            )
+            return
+
         # 대기 중인 충전 요청 확인
         pending = db.get_pending_charge_requests_by_user(message.author.id)
         if not pending:
@@ -119,7 +202,7 @@ class VendingBot(commands.Bot):
 
         # 증거 이미지 URL 저장
         db.set_charge_receipt_image(req['id'], attachment.url)
-        await message.channel.send("✅ 입금 증거 스크린샷이 접수되었습니다! 관리자가 확인 후 승인하면 자동으로 포인트가 충전됩니다 👍")
+        await message.channel.send("✅ 입금 증거 스크린샷이 접수되었습니다! 관리자가 확인 후 승인하면 포인트가 충전됩니다 👍")
 
         # 충전로그 채널에 게시
         channel, err = await self.get_charge_log_channel()
@@ -1135,6 +1218,13 @@ class ChargeRequestModal(discord.ui.Modal):
         bank_holder = db.get_setting('bank_holder', '미설정')
         bank_name = db.get_setting('bank_name', '')
         
+        # 충전 요청 유효 시간 (대시보드 설정값, 기본 30분)
+        try:
+            expire_minutes = int(str(db.get_setting('charge_expire_minutes', '')).strip() or 30)
+        except (TypeError, ValueError):
+            expire_minutes = 30
+        expire_minutes = max(1, min(expire_minutes, 1440))
+        
         # Create charge request
         rid = db.create_charge_request(str(interaction.user.id), interaction.user.name, depositor_name, amount)
         
@@ -1147,30 +1237,38 @@ class ChargeRequestModal(discord.ui.Modal):
         embed.add_field(name="입금자명", value=depositor_name, inline=True)
         embed.add_field(name="충전 금액", value=f"{amount:,}원 → {amount:,}포인트", inline=True)
         embed.add_field(name="🏦 입금 계좌", value=f"{bank_name} {bank_account} ({bank_holder})", inline=False)
-        embed.add_field(name="📌 안내", value=f"아래 **입금 후 입금 확인 화면(스크린샷)을 이 DM으로 보내주세요!**\n\n입금하신 뒤 **{bank_account} ({bank_holder})** 로 송금 완료 화면을 캡처해서 이 DM에 사진으로 보내시면 관리자가 확인 후 승인해드립니다.\n\n⏰ **충전 요청은 5분 뒤 만료됩니다.** 5분 내에 스크린샷을 보내주세요!", inline=False)
-        embed.set_footer(text="냥코 KEY 자판기 🐱 | 증거 스크린샷 접수 후 관리자 승인")
+        embed.add_field(name="📌 안내", value=(
+            f"**{bank_account} ({bank_holder})** 로 입금해주세요.\n\n"
+            f"⚡ **자동 충전**: 입금하면 토스 알림이 서버로 전달되어 **자동으로 충전됩니다!** (보통 1~2분 내)\n\n"
+            f"⏰ **3분 후에도 자동 충전이 안 되면** 봇이 DM으로 알려드립니다!\n\n"
+            f"⏳ **{expire_minutes}분 후에도 충전되지 않았다면**\n"
+            f"📸 입금 완료 사진(스크린샷)을 **이 봇의 DM으로 보내주세요** → 관리자가 확인 후 승인해드립니다.\n\n"
+            f"⚠️ **자동 충전이 이미 완료됐다면 사진을 보내지 마세요!** (완료된 충전건에는 사진 접수가 차단됩니다)"
+        ), inline=False)
+        embed.set_footer(text="냥코 KEY 자판기 🐱 | 자동 충전 우선 · 미처리 시 사진으로 수동 승인")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # 유저 DM으로 증거 스크린샷 안내 전송 (필수 증빙)
+        # 유저 DM으로 자동 충전 대기 안내 전송 (충전 안 될 때만 사진 접수)
         try:
             user = interaction.user
             dm_embed = discord.Embed(
-                title="💰 입금 증거 스크린샷을 보내주세요!",
+                title="⏳ 자동 충전을 기다려주세요!",
                 description=(
-                    f"**{bank_name} {bank_account} ({bank_holder})** 계좌로 입금하신 뒤,\n"
-                    f"**입금 완료 화면(송금 내역 스크린샷)**을 아래 **'봇의 DM에 사진 첨부'**로 보내주세요!\n\n"
-                    f"확인 후 관리자가 수동으로 승인하면 포인트가 충전됩니다."
+                    f"**{bank_name} {bank_account} ({bank_holder})** 로 입금하셨나요?\n\n"
+                    f"입금 알림이 서버에 도착하면 **자동으로 충전됩니다!** (보통 1~2분 내)\n\n"
+                    f"⏰ **{expire_minutes}분 후에도 충전되지 않으면**, 아래 방법으로 입금 완료 사진을 보내주세요.\n"
+                    f"관리자가 확인 후 수동으로 승인해드립니다."
                 ),
                 color=discord.Color.blue()
             )
             dm_embed.add_field(name="🧾 요청번호", value=f"#{rid}", inline=True)
             dm_embed.add_field(name="입금자명", value=depositor_name, inline=True)
             dm_embed.add_field(name="충전 금액", value=f"{amount:,}원 → {amount:,}포인트", inline=True)
-            dm_embed.add_field(name="📌 방법", value="1️⃣ 송금 완료 후 **화면 캡처**\n2️⃣ 이 DM에 **사진(이미지)**을 첨부해서 전송\n3️⃣ 관리자 승인 대기", inline=False)
+            dm_embed.add_field(name="📸 수동 승인 방법 (충전이 안 됐을 때만)", value="1️⃣ 입금 완료 화면 **캡처**\n2️⃣ 이 DM에 **사진(이미지)**을 첨부해서 전송\n3️⃣ 관리자 승인 대기\n\n⚠️ 자동 충전이 완료됐다면 사진을 보내지 마세요!", inline=False)
             await user.send(embed=dm_embed)
         except Exception as e:
-            logger.error(f"[충전] 증거 안내 DM 전송 실패 (유저 {interaction.user.id}): {e}")
+            logger.error(f"[충전] 안내 DM 전송 실패 (유저 {interaction.user.id}): {e}")
 
 
 class BuyProductView(discord.ui.View):
@@ -1826,7 +1924,7 @@ class VendingCommands(commands.Cog):
         embed.add_field(name="봇 이름", value=settings.get('bot_name', '냥코 KEY 자판기'), inline=True)
         embed.add_field(name="입금 계좌", value=settings.get('bank_account', '미설정'), inline=True)
         embed.add_field(name="예금주", value=settings.get('bank_holder', '미설정'), inline=True)
-        embed.add_field(name="Pushbullet", value="✅ 설정됨" if settings.get('pushbullet_token') else "❌ 미설정", inline=True)
+        embed.add_field(name="Tasker 웹훅", value="✅ 자동입금 감지 활성" if settings.get('deposit_webhook_key') else "⚠️ 키 미생성 (대시보드 접속 시 자동 생성)", inline=True)
         embed.add_field(name="대시보드 URL", value=settings.get('dashboard_url', '미설정'), inline=True)
         embed.add_field(name="문의 카테고리", value=settings.get('ticket_category_id', '미설정'), inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)

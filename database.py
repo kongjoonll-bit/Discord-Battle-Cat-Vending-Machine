@@ -111,8 +111,8 @@ def init_db():
         completed_at TEXT DEFAULT NULL
     )''')
 
-    # 기존 DB 마이그레이션: 증거이미지/결정자 컬럼 보장
-    for _col in ('receipt_image_url TEXT DEFAULT \'\'', 'decided_by TEXT'):
+    # 기존 DB 마이그레이션: 증거이미지/결정자/리마인더 발송여부 컬럼 보장
+    for _col in ('receipt_image_url TEXT DEFAULT \'\'', 'decided_by TEXT', 'reminder_sent INTEGER DEFAULT 0'):
         try:
             c.execute(f'ALTER TABLE charge_requests ADD COLUMN {_col}')
         except Exception:
@@ -609,6 +609,42 @@ def get_pending_charge_requests_by_user(user_id):
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def get_recent_charge_requests(limit=20):
+    """최근 충전 요청 목록 (대시보드 진단용, 최신순)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM charge_requests ORDER BY id DESC LIMIT ?', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_charge_requests_needing_reminder(minutes=3, expire_minutes=30, limit=20):
+    """자동 충전 리마인더가 필요한 대기 충전 요청 조회.
+
+    조건: 아직 pending + 리마인더 미발송 + 신청 후 {minutes}분 경과 + 유효 시간({expire_minutes}분) 이내
+    (created_at/completed_at은 SQLite CURRENT_TIMESTAMP = UTC 기준)
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        f"""SELECT * FROM charge_requests
+            WHERE status='pending' AND reminder_sent=0
+              AND datetime(created_at, '+{int(minutes)} minutes') <= datetime('now')
+              AND created_at >= datetime('now', '-{int(expire_minutes)} minutes')
+            ORDER BY id ASC LIMIT {int(limit)}"""
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_charge_reminder_sent(rid):
+    """충전 요청에 리마인더 DM 발송 완료 표시 (중복 발송 방지)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE charge_requests SET reminder_sent=1 WHERE id=?', (int(rid),))
+    conn.commit()
+    conn.close()
 
 def get_user_charge_requests(user_id, limit=10):
     """Get charge requests for a user"""

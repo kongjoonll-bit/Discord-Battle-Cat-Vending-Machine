@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 import asyncio
+import re
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ import requests
 import discord
 import database as db
 from bot import VendingBot
-from pushbullet_monitor import PushbulletMonitor
+from toss_deposit import TossDepositMonitor
 
 # Setup logging
 logging.basicConfig(
@@ -64,7 +65,9 @@ def _validate_session_token(token):
 
 # Global bot instance
 bot = VendingBot()
-pushbullet_monitor = PushbulletMonitor()
+# 토스 입금 알림 전용 모니터 (Tasker 웹훅 전용 — Pushbullet 사용 안 함)
+# 콜백(handle_deposit)은 아래 DEPOSIT HANDLER 정의 후 연결됨
+toss_monitor = TossDepositMonitor()
 
 # ============ PING KEEPER (5분마다) ============
 def _get_ping_url():
@@ -166,10 +169,11 @@ def send_dm_safe(user_id, embed=None, content=None):
 
 # ============ DEPOSIT HANDLER ============
 def handle_deposit(amount, text, depositor=None):
-    """Handle detected deposit from Pushbullet - auto point award when amount AND depositor name match"""
+    """Handle detected deposit - auto point award when amount AND depositor name match"""
     logger.info(f"Processing deposit: {amount}원, depositor: {depositor}, text: {text[:100]}")
+    _record_webhook_log('deposit', f"입금 감지: {amount:,}원 / 입금자: {depositor or '파싱실패'}")
     
-    # Check if charge request is expired (5 min)
+    expire_minutes = _get_charge_expire_minutes()
     pending_charges = db.get_pending_charge_requests()
     from datetime import datetime, timedelta
     # SQLite CURRENT_TIMESTAMP는 UTC로 저장되므로 UTC 기준으로 비교해야 함
@@ -177,12 +181,13 @@ def handle_deposit(amount, text, depositor=None):
     
     # Find matching pending charge request first
     for charge in pending_charges:
-        # Check expiry (5 minutes)
+        # Check expiry (설정값, 기본 30분)
         try:
             created_at = datetime.strptime(charge['created_at'], '%Y-%m-%d %H:%M:%S')
-            if now - created_at > timedelta(minutes=5):
+            if now - created_at > timedelta(minutes=expire_minutes):
                 db.cancel_charge_request(charge['id'])
-                logger.info(f"Charge request #{charge['id']} expired")
+                logger.info(f"Charge request #{charge['id']} expired ({expire_minutes}분 경과)")
+                _record_webhook_log('info', f"충전요청 #{charge['id']} 만료 취소 ({expire_minutes}분 경과, {charge['amount']:,}원)")
                 continue
         except:
             pass
@@ -224,6 +229,7 @@ def handle_deposit(amount, text, depositor=None):
         
         # BOTH amount AND depositor name matched - automatically award points
         logger.info(f"✅ MATCHED! Charge request #{charge['id']} - amount: {amount:,}원, depositor: {charge['depositor_name']}")
+        _record_webhook_log('match', f"자동 충전 성공! 요청 #{charge['id']} ({charge['username']}) {amount:,}원 / 입금자 {charge['depositor_name']}")
         
         # Add points to user (AUTOMATIC)
         new_balance = db.add_balance(
@@ -270,6 +276,7 @@ def handle_deposit(amount, text, depositor=None):
     
     # If no matching charge request found with both amount+name, send unallocated log
     logger.info(f"No matching charge request for {amount:,}원 (depositor: {depositor})")
+    _record_webhook_log('warn', f"미할당 입금: {amount:,}원 (입금자: {depositor or '파싱실패'}) - 금액/입금자명 일치 대기요청 없음")
     
     # Send deposit log to deposit log channel (unmatched)
     embed_log = discord.Embed(
@@ -285,6 +292,9 @@ def handle_deposit(amount, text, depositor=None):
     # Notify admin channel about unallocated deposit
     send_to_discord_channel('admin_channel_id',
         content=f"💰 **입금 감지됨 (미할당)**\n금액: {amount:,}원\n내용: {text[:100]}\n\n대시보드에서 유저에게 포인트를 지급해주세요!")
+
+# 토스 입금 모니터에 입금 처리 콜백 연결
+toss_monitor.on_deposit = handle_deposit
 
 # ============ AUTH DECORATOR ============
 def login_required(f):
@@ -339,6 +349,9 @@ def dashboard():
     # 웹훅 키 보장 (없으면 생성) - 설정 화면에서 항상 확인 가능하게
     webhook_key = _get_or_create_webhook_key()
     settings = db.get_all_settings()
+    # 자동입금 확인 현황 (대시보드 표시용)
+    pending_charges = db.get_recent_charge_requests(10)
+    charge_expire_minutes = _get_charge_expire_minutes()
 
     # 웹훅 전체 URL 만들기: 대시보드 URL → Render 외부 URL → 로컬 순
     _base = (settings.get('dashboard_url', '')
@@ -357,7 +370,9 @@ def dashboard():
         settings=settings,
         bot_status=bot_status,
         bot_name=settings.get('bot_name', '냥코 KEY 자판기'),
-        webhook_full_url=webhook_full_url
+        webhook_full_url=webhook_full_url,
+        pending_charges=pending_charges,
+        charge_expire_minutes=charge_expire_minutes
     )
 
 # ============ API ROUTES ============
@@ -652,24 +667,36 @@ def api_toggle_coupon(cid):
     coupon = db.get_coupon(cid)
     return jsonify({'success': True, 'active': coupon['active'] if coupon else 0})
 
-# --- Pushbullet test ---
-@app.route('/api/pushbullet/test', methods=['POST'])
-@login_required
-def api_test_pushbullet():
-    success, msg = pushbullet_monitor.test_connection()
-    return jsonify({'success': success, 'message': msg})
-
-@app.route('/api/pushbullet/status', methods=['GET'])
-@login_required
-def api_pushbullet_status():
-    """자동충전(Pushbullet) 모니터 상태 조회 - 고장 진단용"""
-    token_set = bool(pushbullet_monitor.get_token())
-    return jsonify({
-        'token_set': token_set,
-        **pushbullet_monitor.get_status()
-    })
-
 # ============ 입금 웹훅 (Pushbullet 없이 폰 앱이 은행 알림을 직접 전송) ============
+
+# ---- 웹훅 진단 로그 (대시보드 표시용 최근 50건 링버퍼) ----
+import collections
+_webhook_log_lock = threading.Lock()
+_webhook_log = collections.deque(maxlen=50)
+
+def _record_webhook_log(level, message):
+    """웹훅 수신/파싱/매칭 결과를 링버퍼에 기록 (대시보드 진단용)"""
+    try:
+        with _webhook_log_lock:
+            _webhook_log.appendleft({
+                'time': datetime.now().strftime('%m-%d %H:%M:%S'),
+                'level': str(level),
+                'message': str(message)[:300],
+            })
+    except Exception:
+        pass
+
+# 충전 요청 유효 시간 기본값 (분) - 설정키: charge_expire_minutes
+DEFAULT_CHARGE_EXPIRE_MINUTES = 30
+
+def _get_charge_expire_minutes():
+    """충전 요청 유효 시간(분) 조회. 대시보드 설정에서 변경 가능 (1~1440분)"""
+    try:
+        val = int(str(db.get_setting('charge_expire_minutes', '')).strip() or DEFAULT_CHARGE_EXPIRE_MINUTES)
+    except (TypeError, ValueError):
+        val = DEFAULT_CHARGE_EXPIRE_MINUTES
+    return max(1, min(val, 1440))
+
 DEPOSIT_WEBHOOK_SETTING_KEY = 'deposit_webhook_key'
 
 def _get_or_create_webhook_key():
@@ -696,11 +723,11 @@ def _get_or_create_webhook_key():
 
 @app.route('/api/deposit-webhook', methods=['GET', 'POST'])
 def api_deposit_webhook():
-    """폰 알림 전달 앱(MacroDroid 등)이 은행 알림을 직접 POST하는 엔드포인트.
+    """폰의 Tasker/MacroDroid가 토스 은행 알림을 직접 POST하는 엔드포인트.
 
     Body(JSON): {"title": "...", "body": "...", "package": "..."}
-    인증: ?key=... 또는 헤더 X-Webhook-Key (대시보드/서버 로그의 키와 일치해야 함)
-    처리는 Pushbullet과 완전히 동일한 파서/매칭 로직을 재사용한다.
+    인증: ?key=... 또는 헤더 X-Webhook-Key (대시보드 설정의 웹훅 URL과 일치해야 함)
+    처리는 toss_deposit.py (토스 전용 파서) → handle_deposit (자동 충전 매칭) 순서.
     """
     if request.method == 'GET':
         # 폰 앱에서 연결 테스트용
@@ -712,6 +739,7 @@ def api_deposit_webhook():
     key = request.args.get('key') or request.headers.get('X-Webhook-Key', '')
     if key != _get_or_create_webhook_key():
         logger.warning(f"[WEBHOOK] 인증 실패한 입금 웹훅 호출 차단 (IP: {request.remote_addr})")
+        _record_webhook_log('error', "❌ 인증 실패(키 불일치)! Tasker/MacroDroid에 저장된 URL이 오래되었습니다. 대시보드 설정의 웹훅 URL을 다시 복사해 넣으세요.")
         return jsonify({'success': False, 'error': 'invalid key'}), 403
 
     # JSON 파싱 (Content-Type 헤더 없이 보내도 강제로 JSON 파싱 - Tasker 설정 단순화)
@@ -727,12 +755,96 @@ def api_deposit_webhook():
         return jsonify({'success': False, 'error': 'empty notification'}), 400
 
     logger.info(f"[WEBHOOK] 폰 알림 수신: pkg={package}, title={title[:60]}, body={body[:80]}")
+    _record_webhook_log('recv', f"수신: pkg={package or '없음'} | {title[:40]} | {body[:70]}")
     try:
-        ok = pushbullet_monitor._process_incoming_push(package, title, body)
+        handled, depositor, amount = toss_monitor.process(title, body)
     except Exception as e:
         logger.error(f"[WEBHOOK] 입금 처리 오류: {e}")
+        _record_webhook_log('error', f"처리 중 오류: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
-    return jsonify({'success': True, 'deposit_detected': bool(ok)})
+    if handled:
+        return jsonify({'success': True, 'deposit_detected': True,
+                        'depositor': depositor, 'amount': amount})
+    _record_webhook_log('warn', "⚠️ 알림을 받았지만 입금으로 인식하지 못했습니다. (대시보드 '웹훅 테스트'로 확인)")
+    return jsonify({'success': True, 'deposit_detected': False})
+
+
+@app.route('/api/deposit-webhook/test', methods=['POST'])
+@login_required
+def api_test_deposit_webhook():
+    """웹훅 파서 + 대기 충전요청 매칭 시뮬레이션 (포인트 지급 없음 - 진단 전용)"""
+    data = request.get_json(silent=True, force=True) or {}
+    title = str(data.get('title') or '').strip()
+    body = str(data.get('body') or '').strip()
+    package = str(data.get('package') or '').strip()
+    if not title and not body:
+        return jsonify({'success': False, 'message': '제목 또는 내용을 입력해주세요.'}), 400
+
+    try:
+        parsed = toss_monitor.test_parse(title, body)
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'파싱 중 오류: {e}'}), 500
+
+    expire_minutes = _get_charge_expire_minutes()
+    result = {
+        'parsed': parsed,
+        'expire_minutes': expire_minutes,
+        'pending_count': 0,
+        'matched': None,
+        'match_hint': '',
+    }
+
+    # 만료되지 않은 대기 요청만 대상
+    from datetime import timedelta as _td
+    now = datetime.utcnow()
+    active = []
+    for charge in db.get_pending_charge_requests():
+        try:
+            created_at = datetime.strptime(charge['created_at'], '%Y-%m-%d %H:%M:%S')
+            if now - created_at > _td(minutes=expire_minutes):
+                continue
+        except Exception:
+            pass
+        active.append(charge)
+    result['pending_count'] = len(active)
+
+    if parsed.get('parsed_ok'):
+        amount = parsed['amount']
+        depositor = (parsed.get('depositor') or '').lower().strip()
+        text_lower = parsed.get('text', '').lower()
+        for charge in active:
+            if charge['amount'] != amount:
+                continue
+            req_name = charge['depositor_name'].lower().strip()
+            req_clean = re.sub(r'[\d,]+원?', '', req_name)
+            req_clean = re.sub(r'입금|충전|계좌|이체|송금', '', req_clean).strip()
+            if (depositor and depositor == req_name) or req_name in text_lower or (req_clean and req_clean in text_lower):
+                result['matched'] = {
+                    'request_id': charge['id'],
+                    'username': charge['username'],
+                    'depositor_name': charge['depositor_name'],
+                    'amount': charge['amount'],
+                }
+                break
+        if result['matched']:
+            result['match_hint'] = f"✅ 실제 입금이라면 요청 #{result['matched']['request_id']}({result['matched']['username']})에 자동 충전됩니다."
+        elif not active:
+            result['match_hint'] = "⚠️ 유효한 대기 충전 요청이 없습니다. 유저가 먼저 '충전 신청'을 해야 자동 충전이 됩니다."
+        else:
+            result['match_hint'] = "⚠️ 금액+입금자명이 둘 다 일치하는 대기 요청이 없습니다. 충전 신청 금액과 입금자명이 알림과 정확히 같아야 합니다."
+    else:
+        result['match_hint'] = "❌ 알림에서 금액/입금자명을 추출하지 못했습니다. 알림 텍스트에 금액(원)과 입금자명이 포함되어야 합니다."
+
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/deposit-webhook/logs', methods=['GET'])
+@login_required
+def api_deposit_webhook_logs():
+    """최근 웹훅 수신/처리 로그 (고장 진단용)"""
+    with _webhook_log_lock:
+        logs = list(_webhook_log)
+    return jsonify({'success': True, 'logs': logs})
 
 
 # --- Stats ---
@@ -757,18 +869,6 @@ def start_bot():
     bot.run_bot(token)
     logger.info("Bot thread started")
 
-def start_pushbullet():
-    """Start Pushbullet monitor"""
-    # Load Pushbullet token from .env into database if not already set
-    env_token = os.environ.get('PUSHBULLET_TOKEN', '')
-    if env_token:
-        db.set_setting('pushbullet_token', env_token)
-        logger.info("Pushbullet token loaded from .env")
-    
-    pushbullet_monitor.on_deposit_detected = handle_deposit
-    pushbullet_monitor.start()
-    logger.info("Pushbullet monitor started (WebSocket 실시간 감지)")
-
 def start_ping_keeper():
     """Start 24h ping keeper"""
     thread = threading.Thread(target=ping_keeper, daemon=True)
@@ -778,9 +878,6 @@ def start_ping_keeper():
 # ============ STARTUP (runs on import for gunicorn) ============
 # Start bot
 start_bot()
-
-# Start pushbullet monitor
-start_pushbullet()
 
 # Start ping keeper
 start_ping_keeper()

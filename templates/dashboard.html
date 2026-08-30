@@ -547,6 +547,46 @@
                 <p style="color: #888; text-align: center; padding: 20px;">✅ 대기 중인 주문이 없습니다.</p>
                 {% endif %}
             </div>
+            
+            <div class="card">
+                <h3><i class="fas fa-coins"></i> 충전 요청 현황 (자동입금 확인) 
+                    <small style="font-weight:400;color:#888;font-size:12px;margin-left:8px;">유효 시간 {{ charge_expire_minutes }}분</small>
+                </h3>
+                {% if pending_charges %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>요청번호</th>
+                            <th>유저</th>
+                            <th>입금자명</th>
+                            <th>금액</th>
+                            <th>상태</th>
+                            <th>신청시간(UTC)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for c in pending_charges %}
+                        <tr>
+                            <td>#{{ c.id }}</td>
+                            <td>{{ c.username }}</td>
+                            <td>{{ c.depositor_name }}</td>
+                            <td>{{ '{:,}'.format(c.amount) }}원</td>
+                            <td>
+                                {% if c.status == 'pending' %}<span class="badge badge-pending">대기중</span>
+                                {% elif c.status == 'completed' %}<span class="badge badge-completed">자동/수동 완료</span>
+                                {% elif c.status == 'cancelled' %}<span class="badge badge-cancelled">취소/만료</span>
+                                {% else %}{{ c.status }}{% endif %}
+                            </td>
+                            <td>{{ c.created_at }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p style="color: #888; text-align: center; padding: 20px;">충전 요청 기록이 없습니다.</p>
+                {% endif %}
+                <small style="opacity:.6;display:block;margin-top:8px;">💡 대기중 상태에서 유효 시간 안에 금액+입금자명이 일치하는 입금 알림(Tasker 웹훅)이 오면 자동 충전됩니다.</small>
+            </div>
         </div>
         
         <!-- Orders Tab -->
@@ -739,10 +779,6 @@
                     <input type="password" id="set-discord-token" value="{{ settings.get('discord_token', '') }}" placeholder="봇 토큰 입력">
                 </div>
                 <div class="form-group">
-                    <label>Pushbullet 토큰</label>
-                    <input type="password" id="set-pushbullet-token" value="{{ settings.get('pushbullet_token', '') }}" placeholder="Pushbullet 토큰 입력">
-                </div>
-                <div class="form-group">
                     <label>관리자 비밀번호</label>
                     <input type="password" id="set-admin-password" value="{{ settings.get('admin_password', 'admin1234') }}">
                 </div>
@@ -769,7 +805,27 @@
                 <div class="form-group">
                     <label>📲 입금 자동감지 웹훅 URL (Tasker 앱에 이 주소를 그대로 입력)</label>
                     <input type="text" value="{{ webhook_full_url }}" readonly onclick="this.select()">
-                    <small style="opacity:.7;display:block;margin-top:4px">아래 은행 알림이 오면 Tasker가 이 주소로 전송합니다. Render 배포 시 이 주소가 자동으로 Render 도메인으로 바뀝니다.</small>
+                    <small style="opacity:.7;display:block;margin-top:4px">아래 은행 알림이 오면 Tasker가 이 주소로 전송합니다. Render 재배포 후 자동 충전이 안 되면 <b>이 URL을 다시 복사해서 Tasker에 갱신</b>하세요 (서버 재시작 시 키가 바뀔 수 있습니다).</small>
+                </div>
+                <div class="form-group">
+                    <label>⏱️ 충전 요청 유효 시간 (분) — 이 시간 안에 입금 알림이 와야 자동 충전됩니다</label>
+                    <input type="number" id="set-charge-expire" min="1" max="1440" value="{{ charge_expire_minutes }}">
+                    <small style="opacity:.7;display:block;margin-top:4px">충전 신청 후 이 시간이 지나면 요청이 만료되어 자동 충전되지 않습니다. (기본 30분)</small>
+                </div>
+                <div class="form-group">
+                    <label>🧪 웹훅 테스트 — 실제 은행 알림 문구를 넣어 파싱/매칭을 미리 확인하세요</label>
+                    <input type="text" id="webhook-test-text" placeholder="예: 5,000원 입금 홍길동 → 내 토스뱅크 아이 통장">
+                    <button class="btn btn-primary btn-sm" onclick="testDepositWebhook()" style="margin-top:8px;">
+                        <i class="fas fa-vial"></i> 테스트 실행
+                    </button>
+                    <div id="webhook-test-result" style="margin-top:8px;"></div>
+                </div>
+                <div class="form-group">
+                    <label>📜 최근 웹훅 수신 로그 (Tasker → 서버 도달 여부 진단)</label>
+                    <button class="btn btn-sm" onclick="loadWebhookLogs()" style="margin:6px 0;">
+                        <i class="fas fa-sync"></i> 로그 새로고침
+                    </button>
+                    <div id="webhook-logs-container" style="max-height:220px;overflow-y:auto;background:rgba(0,0,0,.25);border-radius:8px;padding:10px;font-size:12px;font-family:monospace;"></div>
                 </div>
                 <div class="form-group">
                     <label>입고 알림 채널 ID</label>
@@ -819,12 +875,8 @@
             </div>
             
             <div class="card">
-                <h3><i class="fas fa-plug"></i> Pushbullet 연결 테스트</h3>
-                <p style="color: #888; margin-bottom: 15px;">Pushbullet 토큰을 저장한 후 연결을 테스트할 수 있습니다.</p>
-                <button class="btn btn-info" onclick="testPushbullet()">
-                    <i class="fas fa-plug"></i> 연결 테스트
-                </button>
-                <div id="pushbullet-test-result" style="margin-top: 15px;"></div>
+                <h3><i class="fas fa-mobile-alt"></i> Tasker(폰) 설정 안내</h3>
+                <p style="color: #888; margin-bottom: 15px;">1️⃣ 위의 <b>입금 자동감지 웹훅 URL</b>을 복사 → 2️⃣ 폰 Tasker에서 <b>Event &gt; UI &gt; Notification</b> 프로필 생성 (앱: 토스) → 3️⃣ 작업에 <b>HTTP Request(POST)</b> 추가, Body: {"title":"%evtprm1","body":"%evtprm2","package":"%evtprm3"} → 4️⃣ 토스 입금 알림 발생 시 아래 <b>최근 웹훅 수신 로그</b>에 기록되는지 확인</p>
             </div>
         </div>
         

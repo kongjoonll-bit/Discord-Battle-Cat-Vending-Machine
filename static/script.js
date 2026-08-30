@@ -15,6 +15,7 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
         if (tab === 'users') loadUsers();
         if (tab === 'coupons') loadCoupons();
         if (tab === 'admins') loadAdmins();
+        if (tab === 'settings') loadWebhookLogs();
     });
 });
 
@@ -377,7 +378,6 @@ async function saveSettings() {
     const data = {
         bot_name: document.getElementById('set-bot-name').value,
         discord_token: document.getElementById('set-discord-token').value,
-        pushbullet_token: document.getElementById('set-pushbullet-token').value,
         admin_password: document.getElementById('set-admin-password').value,
         dashboard_url: document.getElementById('set-dashboard-url').value,
         admin_channel_id: document.getElementById('set-admin-channel').value,
@@ -391,6 +391,10 @@ async function saveSettings() {
         use_categories: document.getElementById('set-use-categories').value
     };
     
+    // 충전 요청 유효 시간 (자동입금 확인)
+    const expireEl = document.getElementById('set-charge-expire');
+    if (expireEl) data.charge_expire_minutes = expireEl.value;
+    
     try {
         const resp = await fetch('/api/settings', {
             method: 'POST',
@@ -403,6 +407,67 @@ async function saveSettings() {
         }
     } catch (e) {
         showToast('설정 저장 실패', 'error');
+    }
+}
+
+// ============ DEPOSIT WEBHOOK 진단 (Tasker 자동입금 확인) ============
+async function testDepositWebhook() {
+    const resultDiv = document.getElementById('webhook-test-result');
+    const textEl = document.getElementById('webhook-test-text');
+    if (!resultDiv || !textEl) return;
+    const text = textEl.value.trim();
+    if (!text) {
+        resultDiv.innerHTML = '<p style="color:#e74c3c;">알림 텍스트를 입력하세요. (예: 5,000원 입금 홍길동)</p>';
+        return;
+    }
+    resultDiv.innerHTML = '<p style="color:#888;">테스트 중...</p>';
+    try {
+        const resp = await fetch('/api/deposit-webhook/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ body: text })
+        });
+        const data = await resp.json();
+        if (!data.success) {
+            resultDiv.innerHTML = '<p style="color:#e74c3c;">❌ ' + (data.message || '테스트 실패') + '</p>';
+            return;
+        }
+        const p = data.parsed || {};
+        let html = '<div style="font-size:13px;font-family:monospace;background:rgba(0,0,0,.25);border-radius:8px;padding:10px;line-height:1.7;">';
+        html += '금액 추출: <b style="color:' + (p.amount ? '#2ecc71' : '#e74c3c') + '">' + (p.amount ? p.amount.toLocaleString() + '원' : '실패') + '</b>　|　';
+        html += '입금자 추출: <b style="color:' + (p.depositor ? '#2ecc71' : '#e74c3c') + '">' + (p.depositor || '실패') + '</b><br>';
+        html += '유효 대기 충전요청: ' + data.pending_count + '개 (유효시간 ' + data.expire_minutes + '분)<br>';
+        if (data.matched) {
+            html += '<span style="color:#2ecc71;">✅ 매칭 성공: 요청 #' + data.matched.request_id + ' (' + data.matched.username + ' / ' + data.matched.depositor_name + ' / ' + data.matched.amount.toLocaleString() + '원)</span><br>';
+        }
+        html += '<span style="color:#aaa;">' + (data.match_hint || '') + '</span>';
+        html += '</div>';
+        resultDiv.innerHTML = html;
+    } catch (e) {
+        resultDiv.innerHTML = '<p style="color:#e74c3c;">❌ 요청 실패: ' + e + '</p>';
+    }
+}
+
+async function loadWebhookLogs() {
+    const container = document.getElementById('webhook-logs-container');
+    if (!container) return;
+    try {
+        const resp = await fetch('/api/deposit-webhook/logs');
+        const data = await resp.json();
+        if (!data.success || !data.logs || !data.logs.length) {
+            container.innerHTML = '<div style="color:#888;padding:4px 0;">수신 기록이 없습니다. 폰(Tasker)에서 알림이 전송되지 않았거나 URL/키가 틀렸을 수 있습니다.<br>① 폰에서 웹훅 URL(GET 테스트) 접속 → ② 실제 은행 알림 발생 → ③ 이 로그 새로고침</div>';
+            return;
+        }
+        container.innerHTML = data.logs.map(l => {
+            let color = '#aaaaaa';
+            if (l.level === 'error') color = '#e74c3c';
+            else if (l.level === 'warn') color = '#f39c12';
+            else if (l.level === 'match') color = '#2ecc71';
+            else if (l.level === 'deposit') color = '#3498db';
+            return '<div style="color:' + color + ';padding:2px 0;border-bottom:1px dashed rgba(255,255,255,.06);">[' + l.time + '] ' + l.message.replace(/</g, '&lt;') + '</div>';
+        }).join('');
+    } catch (e) {
+        container.innerHTML = '<div style="color:#e74c3c;">로그 로드 실패: ' + e + '</div>';
     }
 }
 
@@ -425,22 +490,6 @@ async function saveBankSettings() {
         }
     } catch (e) {
         showToast('계좌 설정 저장 실패', 'error');
-    }
-}
-
-async function testPushbullet() {
-    const resultDiv = document.getElementById('pushbullet-test-result');
-    resultDiv.innerHTML = '<p style="color:#888;">테스트 중...</p>';
-    try {
-        const resp = await fetch('/api/pushbullet/test', { method: 'POST' });
-        const data = await resp.json();
-        if (data.success) {
-            resultDiv.innerHTML = '<p style="color:#2ecc71;font-weight:600;">✅ ' + data.message + '</p>';
-        } else {
-            resultDiv.innerHTML = '<p style="color:#e74c3c;font-weight:600;">❌ ' + data.message + '</p>';
-        }
-    } catch (e) {
-        resultDiv.innerHTML = '<p style="color:#e74c3c;font-weight:600;">❌ 테스트 실패</p>';
     }
 }
 
