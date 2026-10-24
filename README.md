@@ -145,12 +145,42 @@ Render 무료 플랜은 여러 서비스가 **아웃바운드 IP를 공유**합�
 Error 1015 ... You are being rate limited
 ```
 
-- 이건 **토큰 문제도 코드 문제도 아닙니다.** 서버 IP가 일시 차단된 상태입니다.
+- 이건 **토큰 문제도 코드 문제도 아닙니다.** Render 무료 플랜은 리전 단위로 **아웃바운드 IP를 모든 고객과 공유**합니다. 같은 IP 대역을 쓰는 다른 서비스가 디스코드 로그인을 남용하면 **내 봇도 같이 차단**되기 때문에, "다른 봇은 멀쩡한데 이 봇만 막히는" 일이 생깁니다.
 - `bot.py`는 이 상황을 감지하면 죽지 않고 **지수 백오프(60초 → 최대 15분)로 자동 재시도**합니다.
   로그에 `[BOT] Cloudflare 1015 감지 ... N초 후 재시도`가 반복되면 차단이 아직 풀리지 않은 것입니다.
-- 대처 방법
-  1. **기다리기**: 보통 수 분 ~ 수십 분 내 자동 해제됩니다. (재시작을 반복하면 차단이 더 길어집니다)
-  2. **재배포로 IP 갱신**: Render에서 Manual Deploy → Restart 를 한 번만 실행
-  3. **호스팅 변경**: 상시 무료 서비스보다는 고정/전용 IP가 있는 환경(VPS, Railway 유료, Fly.io 머신 등)에서 봇을 돌리는 것이 가장 확실합니다
-  4. **로컬 실행**: PC에서 `python main.py`로 봇만 돌려도 됩니다 (대시보드는 Render 유지)
+
+### 해결 방법 (확실한 순서)
+
+| 방법 | 비용 | 설명 |
+|------|------|------|
+| **① 고정 IP 호스팅으로 이전** (가장 확실) | 무료 | Oracle Cloud Always Free(ARM) 같은 상시 무료 VM에 봇+대시보드를 통째로 올리면 아웃바운드 IP를 내가 씁니다. `data/vending.db`도 그대로 복사 |
+| ② 아웃바운드 프록시 | 무료~유료 | 아래 `DISCORD_PROXY`만 설정. 집 PC/VPS에 프록시를 두고 Render가 그 프록시로 나가게 함 |
+| ③ Render Pro + Dedicated IP | 유료 | Pro 워크스페이스 + IP 세트 월 요금. 전용 아웃바운드 IP 3개 제공 |
+| ④ 로컬 실행 | 무료 | PC에서 `python main.py` (대시보드까지 같이 뜸). 24시간 켜 둘 수 있으면 가장 간단 |
+| ⑤ 기다리기 | 무료 | 보통 수 분~수십 분 내 해제. 단 재시작을 반복하면 더 길어집니다 |
+
+### 프록시로 우회하기 (`DISCORD_PROXY`)
+
+Render → Environment 에 추가:
+
+```
+DISCORD_PROXY=http://프록시주소:포트
+DISCORD_PROXY_AUTH=아이디:비밀번호   # 프록시 인증이 필요할 때만
+BOT_LOGIN_MAX_BACKOFF=900            # (선택) 로그인 재시도 최대 대기 초
+```
+
+- discord.py가 **REST 요청과 게이트웨이 WebSocket 연결 모두** 프록시를 통해 나갑니다 (HTTP/HTTPS 프록시 지원).
+- 적용되면 로그에 `[BOT] 아웃바운드 프록시 사용: http://***@...` 가 찍힙니다.
+- 프록시 IP까지 차단되면 효과가 없으므로 **고정 IP를 직접 갖는 ①·④가 가장 확실**합니다.
+
+### 현재 서버 IP 확인
+
+로그인 후 `GET /api/net-diag` (관리자 세션 필요):
+
+```json
+{"outbound_ip":"216.24.x.x","proxy":"","bot_ready":false,"rate_limited":false}
+```
+
+`outbound_ip`가 Render 기본 대역이면 공유 IP를 쓰는 중입니다.
+
 - `PyNaCl is not installed, voice will NOT be supported` / `davey is not installed` 경고는 **음성 기능을 쓰지 않으면 무해**합니다.

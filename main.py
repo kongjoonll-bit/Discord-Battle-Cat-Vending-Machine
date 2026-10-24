@@ -1306,6 +1306,29 @@ def api_clear_deposit_webhook_logs():
     return jsonify({'success': True, 'message': '로그가 삭제되었습니다.'})
 
 
+# --- 셀프 진단 (봇이 안 뜰 때 / IP 차단 여부 확인) ---
+@app.route('/api/net-diag', methods=['GET'])
+@login_required
+def api_net_diag():
+    """서버의 아웃바운드 IP와 봇 연결 상태를 돌려준다.
+
+    Cloudflare 1015(디스코드 로그인 IP 차단)는 이 IP 단위로 발생하므로,
+    차단이 의심될 때 현재 IP를 확인하고 호스팅/프록시를 바꾸는 데 사용한다.
+    """
+    outbound_ip = ''
+    try:
+        outbound_ip = requests.get('https://api.ipify.org', timeout=5).text.strip()
+    except Exception as e:
+        logger.warning(f"[DIAG] 아웃바운드 IP 조회 실패: {e}")
+    return jsonify({
+        'outbound_ip': outbound_ip,
+        'proxy': getattr(bot, 'proxy_label', '') or '',
+        'bot_ready': bot.is_ready() if bot else False,
+        'bot_user': str(bot.user) if getattr(bot, 'user', None) else '',
+        'rate_limited': bot._is_rate_limited() if bot else False,
+    })
+
+
 # --- Stats ---
 @app.route('/api/stats', methods=['GET'])
 @login_required

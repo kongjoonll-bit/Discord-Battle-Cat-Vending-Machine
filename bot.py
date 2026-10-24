@@ -143,15 +143,48 @@ def _classify_login_error(err):
 
 
 def _login_retry_delay(kind, attempt):
-    """로그인 재시도 대기 시간(초) - 지수 백오프 + 지터, 최대 15분
+    """로그인 재시도 대기 시간(초) - 지수 백오프 + 지터
 
     재시도 자체가 차단을 연장하므로 첫 대기부터 넉넉하게 잡는다.
+    상한은 BOT_LOGIN_MAX_BACKOFF 환경변수로 조정 (기본 900초 = 15분)
     """
     if kind == 'invalid_token':
         return 300.0
+    try:
+        cap = float(os.environ.get('BOT_LOGIN_MAX_BACKOFF', '900') or 900)
+    except (TypeError, ValueError):
+        cap = 900.0
+    cap = max(30.0, min(cap, 3600.0))
     base = 60.0 if kind == 'cloudflare_ban' else 15.0
-    delay = min(base * (2 ** min(max(attempt - 1, 0), 4)), 900.0)
+    delay = min(base * (2 ** min(max(attempt - 1, 0), 4)), cap)
     return delay * random.uniform(0.9, 1.1)
+
+
+def _proxy_settings():
+    """DISCORD_PROXY / DISCORD_PROXY_AUTH 환경변수(또는 설정값) → (url, auth, 라벨)
+
+    Cloudflare 1015(공유 IP 차단) 우회용. discord.py 2.x는 이 값을 REST 요청과
+    게이트웨이 WebSocket 연결 **양쪽에 모두** 적용한다.
+      예) DISCORD_PROXY=http://203.0.113.7:3128
+          DISCORD_PROXY_AUTH=user:pass   (프록시가 인증을 요구할 때만)
+    """
+    try:
+        url = (os.environ.get('DISCORD_PROXY', '')
+               or db.get_setting('discord_proxy', '') or '').strip()
+        if not url:
+            return None, None, ''
+        auth = None
+        raw_auth = (os.environ.get('DISCORD_PROXY_AUTH', '')
+                    or db.get_setting('discord_proxy_auth', '') or '').strip()
+        if raw_auth and ':' in raw_auth:
+            import aiohttp  # discord.py 의존성이라 항상 설치되어 있음
+            user, _, pwd = raw_auth.partition(':')
+            auth = aiohttp.BasicAuth(user, pwd)
+        label = re.sub(r'//[^@/]*@', '//***@', url)  # 자격증명 마스킹
+        return url, auth, label
+    except Exception as e:
+        logger.warning(f"[BOT] 프록시 설정 해석 실패(무시하고 직접 연결): {e}")
+        return None, None, ''
 
 
 class VendingBot(commands.Bot):
@@ -160,7 +193,12 @@ class VendingBot(commands.Bot):
         intents.message_content = True
         intents.members = True
         intents.presences = True
-        super().__init__(command_prefix='!', intents=intents)
+        proxy, proxy_auth, proxy_label = _proxy_settings()
+        super().__init__(command_prefix='!', intents=intents,
+                         proxy=proxy, proxy_auth=proxy_auth)
+        self.proxy_label = proxy_label
+        if proxy_label:
+            logger.info(f"[BOT] 아웃바운드 프록시 사용: {proxy_label} (Cloudflare 1015 우회)")
         self.deposit_callback = None
         self.ready_event = asyncio.Event()
         self.vending_messages = {}
@@ -752,10 +790,13 @@ class VendingBot(commands.Bot):
                             "대시보드 설정 또는 DISCORD_TOKEN 환경변수를 확인하세요. "
                             f"({delay:.0f}초 후 재확인)")
                     elif kind == 'cloudflare_ban':
+                        hint = "" if self.proxy_label else (
+                            " Render 공유 IP라 남의 남용에 휘말린 상태입니다. "
+                            "DISCORD_PROXY 환경변수로 다른 IP를 쓰거나, 고정 IP 환경(VPS/Oracle 무료 티어)으로 이전하면 해결됩니다.")
                         logger.warning(
                             "[BOT] Cloudflare 1015 감지 - 디스코드가 이 서버 IP를 일시 차단했습니다. "
                             f"{delay:.0f}초 후 재시도합니다 (시도 #{attempt}). "
-                            "코드 문제가 아니며, 보통 수 분~수십 분 내 자동 해제됩니다.")
+                            "코드 문제가 아니며, 보통 수 분~수십 분 내 자동 해제됩니다." + hint)
                     elif kind == 'rate_limit':
                         logger.warning(
                             f"[BOT] 로그인 429(레이트리밋) - {delay:.0f}초 후 재시도합니다 "
