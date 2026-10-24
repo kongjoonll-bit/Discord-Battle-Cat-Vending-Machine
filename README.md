@@ -135,3 +135,22 @@ __pycache__/
 | `/키추가` | 상품에 키 추가 |
 | `/관리자추가` | 관리자 추가 |
 | `/설정확인` | 봇 설정 확인 |
+
+## 🚑 봇이 안 뜰 때 (429 / Cloudflare 1015)
+
+Render 무료 플랜은 여러 서비스가 **아웃바운드 IP를 공유**합니다. 그 IP가 디스코드 로그인 엔드포인트에서 남용으로 판정되면, 디스코드 앞단 Cloudflare가 HTML 오류 페이지를 돌려줍니다.
+
+```
+429 Too Many Requests ... Access denied | discord.com used Cloudflare to restrict access
+Error 1015 ... You are being rate limited
+```
+
+- 이건 **토큰 문제도 코드 문제도 아닙니다.** 서버 IP가 일시 차단된 상태입니다.
+- `bot.py`는 이 상황을 감지하면 죽지 않고 **지수 백오프(60초 → 최대 15분)로 자동 재시도**합니다.
+  로그에 `[BOT] Cloudflare 1015 감지 ... N초 후 재시도`가 반복되면 차단이 아직 풀리지 않은 것입니다.
+- 대처 방법
+  1. **기다리기**: 보통 수 분 ~ 수십 분 내 자동 해제됩니다. (재시작을 반복하면 차단이 더 길어집니다)
+  2. **재배포로 IP 갱신**: Render에서 Manual Deploy → Restart 를 한 번만 실행
+  3. **호스팅 변경**: 상시 무료 서비스보다는 고정/전용 IP가 있는 환경(VPS, Railway 유료, Fly.io 머신 등)에서 봇을 돌리는 것이 가장 확실합니다
+  4. **로컬 실행**: PC에서 `python main.py`로 봇만 돌려도 됩니다 (대시보드는 Render 유지)
+- `PyNaCl is not installed, voice will NOT be supported` / `davey is not installed` 경고는 **음성 기능을 쓰지 않으면 무해**합니다.

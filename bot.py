@@ -121,6 +121,39 @@ def _message_has_vending_components(msg):
             stack.extend(children)
     return False
 
+# ---- 로그인 실패 원인 분류 / 재시도 백오프 (Cloudflare 1015 = 공유 IP 차단 대응) ----
+def _classify_login_error(err):
+    """봇 로그인 실패 원인 분류
+
+    Returns: 'invalid_token' | 'cloudflare_ban' | 'rate_limit' | 'other'
+    - cloudflare_ban: 디스코드 앞단 Cloudflare가 IP를 일시 차단 (Error 1015, HTML 응답)
+    - rate_limit: 디스코드 API 429
+    - invalid_token: 토큰 자체가 잘못됨 (재시도로 해결되지 않음)
+    """
+    status = getattr(err, 'status', None)
+    text = str(err).lower()
+    if 'improper token' in text or 'invalid token' in text or status == 401:
+        return 'invalid_token'
+    if ('1015' in text or 'access denied' in text or 'cloudflare' in text
+            or 'being rate limited' in text or 'banned' in text):
+        return 'cloudflare_ban'
+    if status == 429 or '429' in text or 'too many requests' in text:
+        return 'rate_limit'
+    return 'other'
+
+
+def _login_retry_delay(kind, attempt):
+    """로그인 재시도 대기 시간(초) - 지수 백오프 + 지터, 최대 15분
+
+    재시도 자체가 차단을 연장하므로 첫 대기부터 넉넉하게 잡는다.
+    """
+    if kind == 'invalid_token':
+        return 300.0
+    base = 60.0 if kind == 'cloudflare_ban' else 15.0
+    delay = min(base * (2 ** min(max(attempt - 1, 0), 4)), 900.0)
+    return delay * random.uniform(0.9, 1.1)
+
+
 class VendingBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -167,7 +200,13 @@ class VendingBot(commands.Bot):
         return retry_after
     
     async def setup_hook(self):
-        await self.add_cog(VendingCommands(self))
+        # 로그인 재시도로 새 이벤트 루프가 만들어지면, 이전(죽은) 루프에 묶인
+        # asyncio 객체를 그대로 쓰면 'bound to a different event loop' 오류가 난다.
+        self.ready_event = asyncio.Event()
+        self._refresh_lock = asyncio.Lock()
+        self._purchase_locks = {}
+        if self.get_cog('VendingCommands') is None:
+            await self.add_cog(VendingCommands(self))
         self.tree.on_error = self.on_app_command_error
         await self.sync_commands()
         logger.info(f"========== 봇 버전 {BOT_VERSION} 로드 완료 ==========")
@@ -689,12 +728,47 @@ class VendingBot(commands.Bot):
             return False
     
     def run_bot(self, token):
+        """봇 실행 스레드 시작 - 로그인 실패 시 스레드를 죽이지 않고 백오프 재시도
+
+        Render 무료 플랜처럼 공유 IP를 쓰는 환경에서는 Cloudflare가 discord.com
+        로그인 요청을 Error 1015(HTML)로 막는 경우가 있다. 이때 즉시 재시도하면
+        차단이 더 길어지므로, 지수 백오프(최대 15분)로 계속 재시도한다.
+        """
         def _run():
-            try:
-                self.run(token)
-            except Exception as e:
-                logger.error(f"Bot run error: {e}")
-        thread = threading.Thread(target=_run, daemon=True)
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    logger.info(f"[BOT] 디스코드 로그인 시도 #{attempt}")
+                    self.run(token)
+                    logger.info("[BOT] 봇 세션이 정상 종료되었습니다.")
+                    return
+                except Exception as e:
+                    kind = _classify_login_error(e)
+                    delay = _login_retry_delay(kind, attempt)
+                    if kind == 'invalid_token':
+                        logger.error(
+                            "[BOT] 디스코드 토큰이 유효하지 않습니다. "
+                            "대시보드 설정 또는 DISCORD_TOKEN 환경변수를 확인하세요. "
+                            f"({delay:.0f}초 후 재확인)")
+                    elif kind == 'cloudflare_ban':
+                        logger.warning(
+                            "[BOT] Cloudflare 1015 감지 - 디스코드가 이 서버 IP를 일시 차단했습니다. "
+                            f"{delay:.0f}초 후 재시도합니다 (시도 #{attempt}). "
+                            "코드 문제가 아니며, 보통 수 분~수십 분 내 자동 해제됩니다.")
+                    elif kind == 'rate_limit':
+                        logger.warning(
+                            f"[BOT] 로그인 429(레이트리밋) - {delay:.0f}초 후 재시도합니다 "
+                            f"(시도 #{attempt})")
+                    else:
+                        logger.error(
+                            f"[BOT] 봇 실행 오류: {e!r} - {delay:.0f}초 후 재시도합니다 "
+                            f"(시도 #{attempt})")
+                    try:
+                        time.sleep(delay)
+                    except Exception:
+                        return
+        thread = threading.Thread(target=_run, daemon=True, name='discord-bot')
         thread.start()
         return thread
     
