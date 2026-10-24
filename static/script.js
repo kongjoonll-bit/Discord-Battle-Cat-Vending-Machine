@@ -1,3 +1,21 @@
+// ============ CSRF 보호 (모든 상태 변경 요청에 토큰 자동 첨부) ============
+(function () {
+    const meta = document.querySelector('meta[name="csrf-token"]');
+    const csrfToken = meta ? meta.getAttribute('content') : '';
+    if (!csrfToken) return;
+    const originalFetch = window.fetch;
+    window.fetch = function (input, init) {
+        const options = init ? Object.assign({}, init) : {};
+        const method = (options.method || 'GET').toUpperCase();
+        if (['POST', 'PUT', 'PATCH', 'DELETE'].indexOf(method) !== -1) {
+            const headers = new Headers(options.headers || {});
+            if (!headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrfToken);
+            options.headers = headers;
+        }
+        return originalFetch(input, options);
+    };
+})();
+
 // ============ TAB NAVIGATION ============
 document.querySelectorAll('.sidebar nav a').forEach(link => {
     link.addEventListener('click', (e) => {
@@ -14,6 +32,9 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
         if (tab === 'keys') loadKeys();
         if (tab === 'users') loadUsers();
         if (tab === 'coupons') loadCoupons();
+        if (tab === 'sale') loadSale();
+        if (tab === 'stocklog') loadStockLogs();
+        if (tab === 'auditlog') loadAuditLogs();
         if (tab === 'admins') loadAdmins();
         if (tab === 'depositlog') loadWebhookLogs();
     });
@@ -613,13 +634,17 @@ async function loadCoupons() {
             return;
         }
         
-        let html = '<table><thead><tr><th>ID</th><th>코드</th><th>할인 금액</th><th>사용 현황</th><th>상태</th><th>생성일</th><th>작업</th></tr></thead><tbody>';
+        let html = '<table><thead><tr><th>ID</th><th>코드</th><th>할인</th><th>사용 현황</th><th>상태</th><th>생성일</th><th>작업</th></tr></thead><tbody>';
         coupons.forEach(function(c) {
             const uses = c.max_uses > 0 ? c.used_count + '/' + c.max_uses : c.used_count + '/무제한';
+            const isPercent = c.discount_type === 'percent';
+            const discountText = isPercent
+                ? c.discount_amount + '% 할인'
+                : c.discount_amount.toLocaleString() + '포인트';
             html += '<tr>';
             html += '<td>' + c.id + '</td>';
             html += '<td><strong>' + c.code + '</strong></td>';
-            html += '<td>' + c.discount_amount.toLocaleString() + '포인트</td>';
+            html += '<td>' + discountText + '</td>';
             html += '<td>' + uses + '</td>';
             html += '<td>' + (c.active ? '<span class="badge badge-completed">활성</span>' : '<span class="badge badge-cancelled">비활성</span>') + '</td>';
             html += '<td>' + c.created_at + '</td>';
@@ -640,6 +665,8 @@ async function saveCoupon() {
     const code = document.getElementById('coupon-code').value.trim();
     const discount = parseInt(document.getElementById('coupon-discount').value);
     const maxUses = parseInt(document.getElementById('coupon-max-uses').value);
+    const typeEl = document.getElementById('coupon-discount-type');
+    const discountType = typeEl ? typeEl.value : 'amount';
     
     if (!code) {
         showToast('쿠폰 코드를 입력해주세요.', 'error');
@@ -649,12 +676,21 @@ async function saveCoupon() {
         showToast('할인 금액을 입력해주세요.', 'error');
         return;
     }
+    if (discountType === 'percent' && discount > 100) {
+        showToast('할인율은 100% 이하여야 합니다.', 'error');
+        return;
+    }
     
     try {
         const resp = await fetch('/api/coupons', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ code: code, discount_amount: discount, max_uses: isNaN(maxUses) ? 0 : maxUses })
+            body: JSON.stringify({
+                code: code,
+                discount_amount: discount,
+                max_uses: isNaN(maxUses) ? 0 : maxUses,
+                discount_type: discountType
+            })
         });
         const data = await resp.json();
         if (data.success) {
@@ -765,3 +801,205 @@ async function removeAdmin(userId) {
         showToast('관리자 제거 실패', 'error');
     }
 }
+
+// ============ SALE (전체 할인 이벤트) ============
+function escapeHtml(text) {
+    return String(text == null ? '' : text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function formatWon(value) {
+    return Number(value || 0).toLocaleString() + '원';
+}
+
+async function loadSale() {
+    try {
+        const resp = await fetch('/api/sale');
+        const sale = await resp.json();
+        const statusEl = document.getElementById('sale-status');
+        if (statusEl) {
+            statusEl.innerHTML = sale.active
+                ? '<strong style="color:#2ecc71;">🔥 할인 진행중</strong> — ' + escapeHtml(sale.summary || '')
+                : '현재 진행 중인 할인이 없습니다.';
+        }
+        const typeEl = document.getElementById('sale-type');
+        const valueEl = document.getElementById('sale-value');
+        const labelEl = document.getElementById('sale-label');
+        const endsEl = document.getElementById('sale-ends-at');
+        if (typeEl) typeEl.value = sale.type || 'percent';
+        if (valueEl && sale.value) valueEl.value = sale.value;
+        if (labelEl) labelEl.value = sale.label || '';
+        if (endsEl) endsEl.value = sale.ends_at || '';
+        updateSalePreview();
+    } catch (e) {
+        showToast('할인 정보를 불러오지 못했습니다.', 'error');
+    }
+}
+
+function updateSalePreview() {
+    const priceEl = document.getElementById('sale-preview-price');
+    const valueEl = document.getElementById('sale-value');
+    const typeEl = document.getElementById('sale-type');
+    const resultEl = document.getElementById('sale-preview-result');
+    if (!priceEl || !valueEl || !typeEl || !resultEl) return;
+
+    const price = parseInt(priceEl.value, 10) || 0;
+    const value = parseInt(valueEl.value, 10) || 0;
+    if (price <= 0 || value <= 0) {
+        resultEl.textContent = '할인 값을 입력하면 적용 가격이 표시됩니다.';
+        return;
+    }
+    const discount = typeEl.value === 'percent'
+        ? Math.floor(price * Math.min(value, 100) / 100)
+        : Math.min(price, value);
+    const finalPrice = Math.max(0, price - discount);
+    resultEl.innerHTML = '<span style="opacity:.7;text-decoration:line-through;">' + formatWon(price) + '</span>'
+        + ' → <strong style="color:#2ecc71;">' + formatWon(finalPrice) + '</strong>'
+        + ' <span style="color:#e17055;">(-' + formatWon(discount) + ')</span>';
+}
+
+async function saveSale() {
+    const payload = {
+        type: document.getElementById('sale-type').value,
+        value: parseInt(document.getElementById('sale-value').value, 10),
+        label: document.getElementById('sale-label').value.trim(),
+        ends_at: document.getElementById('sale-ends-at').value.trim(),
+        active: true
+    };
+    if (!payload.value || payload.value <= 0) {
+        showToast('할인 값을 입력해주세요.', 'error');
+        return;
+    }
+    try {
+        const resp = await fetch('/api/sale', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('할인이 적용되었습니다. 자판기가 곧 갱신됩니다.', 'success');
+            loadSale();
+        } else {
+            showToast(data.error || '할인 적용 실패', 'error');
+        }
+    } catch (e) {
+        showToast('할인 적용 실패', 'error');
+    }
+}
+
+async function stopSale() {
+    if (!confirm('전체 할인을 종료하시겠습니까?')) return;
+    try {
+        const resp = await fetch('/api/sale', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ stop: true })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('할인이 종료되었습니다.', 'success');
+            loadSale();
+        } else {
+            showToast(data.error || '할인 종료 실패', 'error');
+        }
+    } catch (e) {
+        showToast('할인 종료 실패', 'error');
+    }
+}
+
+// ============ STOCK LOGS (입고 기록) ============
+async function loadStockLogs() {
+    const container = document.getElementById('stock-logs-container');
+    if (!container) return;
+    container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">로딩중...</p>';
+    try {
+        const resp = await fetch('/api/stock-logs?limit=100');
+        const logs = await resp.json();
+        if (!Array.isArray(logs) || logs.length === 0) {
+            container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">입고 기록이 없습니다.</p>';
+            return;
+        }
+        let html = '<table><thead><tr><th>시간</th><th>상품</th><th>수량</th><th>총 재고</th><th>경로</th><th>담당</th></tr></thead><tbody>';
+        logs.forEach(function(log) {
+            html += '<tr>';
+            html += '<td>' + escapeHtml(log.created_at) + '</td>';
+            html += '<td>' + escapeHtml(log.product_name) + '</td>';
+            html += '<td style="color:#2ecc71;font-weight:700;">+' + log.count + '</td>';
+            html += '<td>' + log.total_stock + '</td>';
+            html += '<td>' + escapeHtml(log.source) + '</td>';
+            html += '<td>' + escapeHtml(log.actor || '-') + '</td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color:#e74c3c;text-align:center;padding:20px;">입고 기록을 불러오지 못했습니다.</p>';
+    }
+}
+
+
+// ============ AUDIT LOGS (감사 로그) ============
+async function loadAuditLogs() {
+    const container = document.getElementById('audit-logs-container');
+    if (!container) return;
+    container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">로딩중...</p>';
+    try {
+        const resp = await fetch('/api/audit-logs?limit=200');
+        const logs = await resp.json();
+        if (!Array.isArray(logs) || logs.length === 0) {
+            container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">감사 로그가 없습니다.</p>';
+            return;
+        }
+        let html = '<table><thead><tr><th>시간</th><th>동작</th><th>대상</th><th>내용</th></tr></thead><tbody>';
+        logs.forEach(function(log) {
+            html += '<tr>';
+            html += '<td>' + escapeHtml(log.created_at) + '</td>';
+            html += '<td><strong>' + escapeHtml(log.action) + '</strong></td>';
+            html += '<td>' + escapeHtml(log.actor_name || log.actor_id || '-') + '</td>';
+            html += '<td>' + escapeHtml(log.detail) + '</td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color:#e74c3c;text-align:center;padding:20px;">감사 로그를 불러오지 못했습니다.</p>';
+    }
+}
+
+// ============ DM 전체 공지 ============
+async function sendDmNotice() {
+    const title = document.getElementById('dm-title').value.trim();
+    const content = document.getElementById('dm-content').value.trim();
+    const color = document.getElementById('dm-color').value.trim();
+    const resultDiv = document.getElementById('dm-result');
+
+    if (!content) {
+        showToast('DM 내용을 입력해주세요.', 'error');
+        return;
+    }
+    if (!confirm('모든 유저에게 DM을 보내시겠습니까?')) return;
+
+    resultDiv.innerHTML = '<p style="color:#888;">발송 요청 중...</p>';
+    try {
+        const resp = await fetch('/api/notice/dm', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ title: title, content: content, color: color })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            resultDiv.innerHTML = '<p style="color:#2ecc71;font-weight:600;">✅ ' + escapeHtml(data.message || '전송을 시작했습니다.') + '</p>';
+            document.getElementById('dm-content').value = '';
+        } else {
+            resultDiv.innerHTML = '<p style="color:#e74c3c;font-weight:600;">❌ ' + escapeHtml(data.message || data.error || '전송 실패') + '</p>';
+        }
+    } catch (e) {
+        resultDiv.innerHTML = '<p style="color:#e74c3c;font-weight:600;">❌ 요청 실패: ' + escapeHtml(e) + '</p>';
+    }
+}
+

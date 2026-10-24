@@ -33,8 +33,16 @@ Thumbs.db
 # Logs
 *.log
 logs/
-# PB ·Î±×
+# PB ï¿½Î±ï¿½
 pushbullet_log.txt
 start_visible.bat
 test_e2e_charge.py
 test_webhook_charge.py
+
+# Local backup / temp files (nested old copy)
+/Discord-Battle-Cat-Vending-Machine-main/
+_prep.txt
+_sub.txt
+_done.txt
+_v.txt
+

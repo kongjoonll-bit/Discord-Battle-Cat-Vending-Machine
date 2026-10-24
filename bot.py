@@ -3,8 +3,12 @@ from discord import ui
 from discord.ext import commands
 from discord import app_commands
 import asyncio
+from datetime import datetime
+import hashlib
 import logging
 import os
+import random
+import re
 import threading
 import time
 
@@ -12,7 +16,110 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = 'v8.2'  # 자판기 컴포넌트 오류 수정 + 쿠폰 시스템 + 핑 폴백
+BOT_VERSION = 'v9.0'  # 입고로그/할인/상품설명/이모지 버튼/DM공지/0원쿠폰/레이트리밋 안정화
+
+# 커스텀 이모지 표기: <:name:id> 또는 <a:name:id>
+_CUSTOM_EMOJI_RE = re.compile(r'^<(a?):([A-Za-z0-9_~]+):(\d{15,25})>$')
+
+
+def parse_button_emoji(raw):
+    """설정값을 디스코드 버튼 이모지로 변환
+
+    지원 형식:
+      - 유니코드 이모지: "🎁"
+      - 커스텀 이모지 태그: "<:cat:123456789012345678>" / "<a:cat:123456789012345678>"
+      - name:id 형식: "cat:123456789012345678"
+      - 이모지 ID만: "123456789012345678" (서버 이모지)
+      - :name: 형식은 봇이 서버에서 이름으로 찾아 변환 (resolve_button_emoji)
+    """
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    m = _CUSTOM_EMOJI_RE.match(raw)
+    if m:
+        return discord.PartialEmoji(name=m.group(2), id=int(m.group(3)), animated=bool(m.group(1)))
+    if re.fullmatch(r'\d{15,25}', raw):
+        return discord.PartialEmoji(name=None, id=int(raw))
+    if ':' in raw and not raw.startswith(':'):
+        name, _, eid = raw.partition(':')
+        if eid.strip().isdigit():
+            return discord.PartialEmoji(name=name.strip() or None, id=int(eid))
+    return raw
+
+
+def resolve_button_emoji(client, raw):
+    """:name: 형태를 봇이 참여한 서버의 커스텀 이모지로 변환 (없으면 문자열 유지)"""
+    emoji = parse_button_emoji(raw)
+    if isinstance(emoji, str) and emoji.startswith(':') and emoji.endswith(':') and len(emoji) > 2:
+        name = emoji.strip(':')
+        for guild in getattr(client, 'guilds', []) or []:
+            found = discord.utils.get(guild.emojis, name=name)
+            if found:
+                return found
+        return None
+    return emoji
+
+
+def format_price_text(price):
+    """상품 가격 표시 (전체 할인 적용 시 원가 취소선 + 할인가)"""
+    try:
+        base = max(0, int(price))
+    except (TypeError, ValueError):
+        base = 0
+    final, discount = db.apply_sale(base)
+    if discount > 0:
+        return f"~~{base:,}원~~ → **{final:,}원**"
+    return f"**{final:,}원**"
+
+
+def _refresh_interval_seconds():
+    """자판기 자동 새로고침 주기(초) - 대시보드 설정값, 최소 5분"""
+    try:
+        minutes = int(str(db.get_setting('vending_refresh_minutes', '10') or '10').strip())
+    except (TypeError, ValueError):
+        minutes = 10
+    minutes = max(5, min(minutes, 1440))
+    return minutes * 60
+
+def _vending_content_signature():
+    """자판기 메시지 내용이 실제로 바뀌었는지 판별하는 서명 생성
+
+    레이트리밋(429) 예방 핵심: 상품/재고/설정이 안 바뀌었으면
+    Discord API 호출(fetch+edit) 자체를 생략한다.
+    """
+    parts = []
+    for key in ('vending_title', 'vending_desc', 'vending_footer', 'vending_color',
+                'vending_banner_url', 'use_categories',
+                'btn_emoji_product', 'btn_emoji_charge', 'btn_emoji_info', 'btn_emoji_ticket',
+                'btn_emoji_category', 'sale_active', 'sale_type', 'sale_value',
+                'sale_label', 'sale_ends_at'):
+        parts.append(f"{key}={db.get_setting(key, '')}")
+    for p in db.get_products(active_only=True):
+        parts.append(
+            f"p={p['id']}|{p['name']}|{p['price']}|{p.get('category', '')}"
+            f"|{p.get('description', '')}|{db.count_available_keys(p['id'])}"
+        )
+    for cat in db.get_categories():
+        parts.append(f"c={cat}|{len(db.get_products_by_category(cat, active_only=True))}")
+    raw = '||'.join(parts)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+def _message_has_vending_components(msg):
+    """메시지에 자판기 전용 버튼(vending_products)이 포함되어 있는지 재귀 검사"""
+    if not getattr(msg, 'components', None):
+        return False
+    stack = list(msg.components)
+    while stack:
+        comp = stack.pop()
+        cid = getattr(comp, 'custom_id', None)
+        if cid == 'vending_products':
+            return True
+        children = getattr(comp, 'children', None)
+        if children:
+            stack.extend(children)
+    return False
 
 class VendingBot(commands.Bot):
     def __init__(self):
@@ -24,52 +131,190 @@ class VendingBot(commands.Bot):
         self.deposit_callback = None
         self.ready_event = asyncio.Event()
         self.vending_messages = {}
+        # ---- 레이트리밋(429) 방지 상태 ----
+        self._rate_limited_until = 0.0        # time.monotonic() 기준 전역 429 블록 해제 시각
+        self._refresh_lock = asyncio.Lock()   # 자판기 새로고침 중복 실행 방지
+        self._refresh_tick = 0                # 주기적 메시지 실존 확인용 카운터
+        # ---- 백그라운드 태스크 (워치독이 생존 확인 후 재시작) ----
+        self._ping_task = None
+        self._reminder_task = None
+        self._watchdog_task = None
+        # ---- 구매 중복 클릭 방지 (유저별 락) ----
+        self._purchase_locks = {}
+
+    def _is_rate_limited(self):
+        """Discord API 전역 레이트리밋(429) 백오프 중인지 여부"""
+        return time.monotonic() < self._rate_limited_until
+
+    def _note_rate_limit(self, err):
+        """429 응답 기록 - 지정 시간 동안 Discord API 요청을 멈춘다 (악순환 차단)"""
+        retry_after = 10.0  # 최소 10초 백오프
+        exc_retry = getattr(err, 'retry_after', None)
+        if exc_retry:
+            try:
+                retry_after = max(retry_after, float(exc_retry) + 1.0)
+            except (TypeError, ValueError):
+                pass
+        else:
+            # 예외 메시지에서 retry_after 값 파싱 (버전별 호환)
+            m = re.search(r'retry_after["\s:]+([\d.]+)', str(err))
+            if m:
+                try:
+                    retry_after = max(retry_after, float(m.group(1)) + 1.0)
+                except (TypeError, ValueError):
+                    pass
+        self._rate_limited_until = max(self._rate_limited_until, time.monotonic() + retry_after)
+        return retry_after
     
     async def setup_hook(self):
         await self.add_cog(VendingCommands(self))
-        await self.tree.sync()
-        logger.info(f"========== 봇 버전 {BOT_VERSION} 로드 완료 (자판기 오류 수정본 배포 확인용) ==========")
-    
+        self.tree.on_error = self.on_app_command_error
+        await self.sync_commands()
+        logger.info(f"========== 봇 버전 {BOT_VERSION} 로드 완료 ==========")
+
+    async def sync_commands(self, force: bool = False) -> int:
+        """슬래시 명령 동기화 - 변경이 있을 때만 실행
+
+        매 재시작마다 tree.sync()를 호출하면 429(요청 한도)를 유발하므로
+        명령 이름 목록 + 봇 버전으로 서명을 만들어 바뀐 경우에만 동기화한다.
+        강제 동기화: FORCE_COMMAND_SYNC=1 환경변수 또는 대시보드의 동기화 버튼
+        """
+        if force or os.environ.get('FORCE_COMMAND_SYNC', '') == '1':
+            force = True
+        try:
+            names = sorted(c.name for c in self.tree.get_commands())
+            signature = hashlib.sha256(
+                ('|'.join(names) + '|' + BOT_VERSION).encode('utf-8')
+            ).hexdigest()
+            saved = db.get_setting('command_sync_hash', '')
+            if not force and saved == signature:
+                logger.info("[SYNC] 명령어 목록 변경 없음 → 동기화 생략 (레이트리밋 방지)")
+                return 0
+            synced = await self.tree.sync()
+            db.set_setting('command_sync_hash', signature)
+            logger.info(f"[SYNC] 슬래시 명령 {len(synced)}개 동기화 완료")
+            return len(synced)
+        except discord.HTTPException as e:
+            retry_after = self._note_rate_limit(e)
+            logger.error(f"[SYNC] 명령 동기화 실패(HTTP {getattr(e, 'status', '?')}): {e} "
+                         f"→ 약 {retry_after:.0f}초 후 재시도 가능")
+            return -1
+        except Exception as e:
+            logger.error(f"[SYNC] 명령 동기화 오류: {e}")
+            return -1
+
+    async def on_app_command_error(self, interaction: discord.Interaction, error: Exception):
+        """슬래시 명령 예외 처리 - 사용자에게 항상 응답을 주어 '무응답' 방지"""
+        name = getattr(getattr(interaction, 'command', None), 'name', '?')
+        if self._note_rate_limit_if_needed(error):
+            logger.error(f"[CMD] /{name} 레이트리밋: {error!r}")
+        else:
+            logger.error(f"[CMD] /{name} 오류: {error!r}")
+        message = "❌ 명령 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+        if isinstance(error, app_commands.CommandOnCooldown):
+            message = f"⏳ 명령 사용이 너무 잦습니다. {error.retry_after:.1f}초 후 다시 시도해주세요."
+        elif isinstance(error, app_commands.MissingPermissions):
+            message = "❌ 이 명령을 사용할 권한이 없습니다."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except Exception:
+            logger.warning(f"[CMD] /{name} 오류 응답 전송 실패 (상호작용 만료 가능)")
+
+    def _note_rate_limit_if_needed(self, error) -> bool:
+        """예외가 429/요청 한도 관련이면 전역 백오프 등록"""
+        status = getattr(error, 'status', None)
+        if status == 429 or isinstance(error, discord.RateLimited):
+            self._note_rate_limit(error)
+            return True
+        text = str(error).lower()
+        if 'rate limit' in text or '429' in text or 'too many requests' in text:
+            self._note_rate_limit(error)
+            return True
+        return False
+
+    async def on_disconnect(self):
+        logger.warning("[CONN] 디스코드 게이트웨이 연결 끊김 - 자동 재연결 대기")
+
+    async def on_resumed(self):
+        logger.info("[CONN] 세션 재개(resumed) 완료")
+
     async def on_ready(self):
-        logger.info(f"Bot logged in as {self.user} (ID: {self.user.id})")
+        first_ready = not self.ready_event.is_set()
+        logger.info(f"Bot logged in as {self.user} (ID: {self.user.id}) - {BOT_VERSION}")
         self.ready_event.set()
-        await self.change_presence(activity=discord.Game(name=f"냥코 KEY 자판기 🐱 | {BOT_VERSION}"))
-        await self.restore_vending_machines()
-        # 5분 핑 자동 전송 시작 (중복 방지)
-        if not getattr(self, '_ping_task_started', False):
-            self._ping_task_started = True
-            self.loop.create_task(self.ping_loop())
-        # 자동 충전 리마인더 루프 시작 (중복 방지)
-        if not getattr(self, '_reminder_task_started', False):
-            self._reminder_task_started = True
-            self.loop.create_task(self.charge_reminder_loop())
-    
-    async def ping_loop(self):
-        """5분마다 대시보드/자판기 핑 자동 전송 (비블로킹)"""
+        try:
+            await self.change_presence(activity=discord.Game(name=f"냥코 KEY 자판기 🐱 | {BOT_VERSION}"))
+        except Exception as e:
+            logger.warning(f"[READY] 상태 메시지 설정 실패: {e}")
+        if first_ready:
+            await self.restore_vending_machines()
+        else:
+            # 재연결마다 복원 로직을 돌리면 메시지 조회/수정이 폭증해 429를 유발한다
+            logger.info("[READY] 재연결 감지 → 자판기 복원 생략 (주기 새로고침이 처리)")
+        self._ensure_background_tasks()
+
+    def _ensure_background_tasks(self):
+        """백그라운드 루프 시작 (이미 살아있으면 중복 생성하지 않음)"""
+        if self._ping_task is None or self._ping_task.done():
+            self._ping_task = self.loop.create_task(self.ping_loop())
+        if self._reminder_task is None or self._reminder_task.done():
+            self._reminder_task = self.loop.create_task(self.charge_reminder_loop())
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = self.loop.create_task(self.watchdog_loop())
+
+    async def watchdog_loop(self):
+        """60초마다 백그라운드 태스크 생존 확인 → 죽었으면 재시작 (조용히 멈추는 현상 방지)"""
         while True:
+            await asyncio.sleep(60)
             try:
-                # 핑 URL: 설정값 우선, 없으면 Render 외부 URL(RENDER_EXTERNAL_URL) 자동 사용
-                ping_url = db.get_setting('dashboard_url', '') or os.environ.get('RENDER_EXTERNAL_URL', '')
-                if ping_url:
-                    def _do_ping(url=ping_url):
-                        import requests as _req
-                        try:
-                            resp = _req.get(url.rstrip('/') + '/ping', timeout=10)
-                            return resp.status_code
-                        except Exception as e:
-                            logger.warning(f"[PING] error: {e}")
-                            return None
-                    
-                    status = await self.loop.run_in_executor(None, _do_ping)
-                    if status:
-                        logger.info(f"[PING] {ping_url} -> {status} (5분 후 재전송)")
-                
-                # 자판기 새로고침 (재고/상품 상태 최신화)
-                await self.refresh_vending_machines()
-                logger.info("[PING] Vending machines refreshed")
+                if not self.is_ready():
+                    continue
+                if self._ping_task is None or self._ping_task.done():
+                    logger.warning("[WATCHDOG] 새로고침 루프 종료 감지 → 재시작")
+                    self._ping_task = self.loop.create_task(self.ping_loop())
+                if self._reminder_task is None or self._reminder_task.done():
+                    logger.warning("[WATCHDOG] 충전 리마인더 루프 종료 감지 → 재시작")
+                    self._reminder_task = self.loop.create_task(self.charge_reminder_loop())
+            except Exception as e:
+                logger.error(f"[WATCHDOG] 오류: {e}")
+
+    async def ping_loop(self):
+        """자판기 주기 새로고침 + (설정 시) 대시보드 핑 - 429 백오프 중에는 요청 생략"""
+        while True:
+            interval = _refresh_interval_seconds()
+            try:
+                if self.is_ready() and not self._is_rate_limited():
+                    ping_url = db.get_setting('dashboard_url', '') or os.environ.get('RENDER_EXTERNAL_URL', '')
+                    ping_enabled = str(db.get_setting('dashboard_ping_enabled', 'true')).lower() != 'false'
+                    if ping_url and ping_enabled:
+                        ping_url = ping_url.strip().rstrip('/')
+                        if ping_url.endswith('/dashboard'):
+                            ping_url = ping_url[:-len('/dashboard')]
+
+                        def _do_ping(url=ping_url):
+                            import requests as _req
+                            try:
+                                resp = _req.get(url + '/ping', timeout=10)
+                                return resp.status_code
+                            except Exception as e:
+                                logger.warning(f"[PING] error: {e}")
+                                return None
+
+                        status = await self.loop.run_in_executor(None, _do_ping)
+                        if status:
+                            logger.info(f"[PING] {ping_url} -> {status}")
+
+                    # 자판기 새로고침 (재고/상품/할인 상태 최신화)
+                    await self.refresh_vending_machines()
+                    logger.info(f"[PING] 자판기 새로고침 완료 (다음: 약 {interval // 60}분 후)")
+                elif self._is_rate_limited():
+                    logger.info("[PING] 429 백오프 중 → 이번 주기 새로고침 생략")
             except Exception as e:
                 logger.error(f"[PING] Error: {e}")
-            await asyncio.sleep(300)  # 5분
+            await asyncio.sleep(interval + random.uniform(0, 30))
 
     async def charge_reminder_loop(self):
         """30초마다 확인 - 충전 신청 후 3분이 지나도 자동 충전이 안 된 요청에 리마인더 DM 발송"""
@@ -279,31 +524,126 @@ class VendingBot(commands.Bot):
             return False, f"후기 등록 실패: {str(e)}"
     
     async def restore_vending_machines(self):
+        """봇 시작 시 자판기 메시지 복원 - 레이트리밋 안전하게 채널별 간격"""
         channels = db.get_vending_channels()
-        for ch in channels:
+        for i, ch in enumerate(channels):
+            result = "skip"
             try:
                 channel = self.get_channel(int(ch['channel_id']))
                 if channel:
-                    await self.update_vending_machine(channel)
-                    logger.info(f"Vending machine restored in channel {ch['channel_id']}")
+                    result = await self.update_vending_machine(channel)
+                    if result == "updated":
+                        logger.info(f"Vending machine restored in channel {ch['channel_id']}")
+                    elif result == "rate_limited":
+                        logger.warning("[VENDING] restore 중단: 전역 레이트리밋(429) 백오프 시작")
+                        break
             except Exception as e:
                 logger.error(f"Restore vending machine error: {e}")
-    
-    async def update_vending_machine(self, channel):
-        """Components V2 자판기 - 임베드 컨테이너 안에 드롭다운+버튼 통합"""
-        view = VendingMainView()
-        
+            if result == "updated" and i < len(channels) - 1:
+                await asyncio.sleep(1.0)  # 실제 갱신했을 때만 간격 (시작 시 버스트 방지)
+
+    async def update_vending_machine(self, channel, force_edit=False, verify=False):
+        """자판기 메시지 갱신 - 429 레이트리밋에 안전한 로직
+
+        핵심 변경:
+        - 내용이 안 바뀌었으면 API 호출 자체를 생략 (레이트리밋 예방)
+        - 429 발생 시 즉시 재전송하지 않고 백오프 (악순환 차단)
+        - 메시지가 실제로 삭제된 경우(NotFound)에만 새로 전송
+        """
+        if self._is_rate_limited():
+            logger.warning(f"[VENDING] update 스킵: 채널 {channel.id} - 전역 레이트리밋(429) 백오프 중")
+            return "rate_limited"
+
+        # 내용 변경 여부 먼저 판별 - 안 바뀌었으면 뷰 생성/API 호출 전부 생략
+        content_hash = _vending_content_signature()
         existing = db.get_vending_message(channel.id)
+        msg = None
+        hash_unchanged = bool(
+            content_hash and not force_edit
+            and existing and existing.get('content_hash') == content_hash
+        )
+
+        if existing and hash_unchanged and not verify:
+            return "skip"  # 내용 동일 + 실존 확인 불필요 → Discord API 호출 없음
+
+        view = VendingMainView()
+
         if existing:
             try:
                 msg = await channel.fetch_message(int(existing['message_id']))
-                await msg.edit(view=view)
-                return
+            except discord.Forbidden:
+                raise  # 권한 오류는 상위(설치 명령어)에서 사용자 안내하도록 전파
+            except discord.NotFound:
+                msg = None  # 삭제된 메시지 → 아래에서 새로 전송
+                logger.info(f"[VENDING] 저장된 자판기 메시지가 삭제됨 (채널 {channel.id}) - 재설치 진행")
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry = self._note_rate_limit(e)
+                    logger.warning(f"[VENDING] fetch 레이트리밋(429) 채널 {channel.id}: {e} (백오프 {retry}초)")
+                else:
+                    logger.warning(f"[VENDING] fetch 실패 채널 {channel.id}: {e}")
+                return "rate_limited" if e.status == 429 else "failed"
             except Exception as e:
-                logger.warning(f"Vending edit failed, resending: {e}")
-        
-        msg = await channel.send(view=view)
-        db.set_vending_message(channel.id, msg.id)
+                logger.warning(f"[VENDING] fetch 실패 채널 {channel.id}: {e}")
+                return "failed"
+            if hash_unchanged and msg is not None:
+                return "skip"  # verify 모드: 실존 확인만 하고 내용이 같으면 edit 생략
+        else:
+            # DB 기록 없음 - 기존 자판기 메시지가 남아 있으면 재사용 (DB 초기화 등으로 중복 전송 방지)
+            msg = await self._find_existing_vending_message(channel)
+
+        if msg is not None:
+            try:
+                await msg.edit(view=view)
+                db.set_vending_message(channel.id, msg.id, content_hash)
+                return "updated"
+            except discord.Forbidden:
+                raise
+            except discord.NotFound:
+                msg = None  # 수정 직전에 삭제됨 → 재전송
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry = self._note_rate_limit(e)
+                    logger.warning(f"[VENDING] edit 레이트리밋(429) 채널 {channel.id}: {e} (백오프 {retry}초)")
+                else:
+                    logger.warning(f"[VENDING] edit 실패 채널 {channel.id}: {e}")
+                return "rate_limited" if e.status == 429 else "failed"
+            except Exception as e:
+                logger.warning(f"[VENDING] edit 실패 채널 {channel.id}: {e}")
+                return "failed"
+
+        if msg is None:
+            if self._is_rate_limited():
+                logger.warning(f"[VENDING] 전송 스킵: 채널 {channel.id} - 레이트리밋 백오프 중")
+                return "rate_limited"
+            try:
+                new_msg = await channel.send(view=view)
+                db.set_vending_message(channel.id, new_msg.id, content_hash)
+                return "updated"
+            except discord.Forbidden:
+                raise
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry = self._note_rate_limit(e)
+                    logger.warning(f"[VENDING] send 레이트리밋(429) 채널 {channel.id}: {e} (백오프 {retry}초)")
+                else:
+                    logger.warning(f"[VENDING] send 실패 채널 {channel.id}: {e}")
+                return "rate_limited" if e.status == 429 else "failed"
+            except Exception as e:
+                logger.warning(f"[VENDING] send 실패 채널 {channel.id}: {e}")
+                return "failed"
+
+        return "failed"
+
+    async def _find_existing_vending_message(self, channel):
+        """채널 최근 메시지에서 기존 자판기 메시지(버튼 custom_id 포함)를 찾아 재사용"""
+        try:
+            async for msg in channel.history(limit=50):
+                if _message_has_vending_components(msg):
+                    return msg
+        except Exception as e:
+            logger.warning(f"[VENDING] 히스토리 검색 실패 채널 {channel.id}: {e}")
+        return None
     
     async def grant_purchase_role(self, member, product_name=None):
         """구매 완료 시 지정된 역할 자동 지급"""
@@ -424,26 +764,56 @@ class VendingBot(commands.Bot):
             f"❌ **주문 #{order_id} 취소 안내**\n\n주문이 취소되었습니다.\n주문번호: #{order_id}\n상품: {order['product_name']}")
         return True, f"주문 #{order_id} 취소 완료!"
     
-    async def refresh_vending_machines(self):
-        channels = db.get_vending_channels()
-        for ch in channels:
-            try:
-                channel = self.get_channel(int(ch['channel_id']))
-                if channel:
-                    await self.update_vending_machine(channel)
-            except Exception as e:
-                logger.error(f"Refresh vending machine error: {e}")
+    async def refresh_vending_machines(self, force_edit=False):
+        """전 채널 자판기 갱신 - 429 레이트리밋/버스트 방지
+
+        - 동시 호출이 겹치면 하나만 실행 (락)
+        - 실제 API 호출(edit/send)이 있었을 때만 채널 간 간격 유지
+        - 429 발생 시 즉시 중단하고 백오프, 다음 주기에 재시도
+        - 일정 주기마다 메시지 실존 확인(verify)으로 삭제 복구
+        """
+        if self._is_rate_limited():
+            logger.warning("[VENDING] Refresh 스킵: 전역 레이트리밋(429) 백오프 중")
+            return
+
+        if self._refresh_lock.locked():
+            logger.debug("[VENDING] Refresh 이미 진행 중 - 중복 호출 스킵")
+            return
+
+        self._refresh_tick += 1
+        verify = (self._refresh_tick % 6 == 1)  # 약 30분(6주기)마다 메시지 실존 확인
+
+        async with self._refresh_lock:
+            channels = db.get_vending_channels()
+            for i, ch in enumerate(channels):
+                if self._is_rate_limited():
+                    logger.warning("[VENDING] Refresh 중단: 전역 레이트리밋(429) 백오프 시작")
+                    break
+                try:
+                    channel = self.get_channel(int(ch['channel_id']))
+                    if not channel:
+                        continue
+                    result = await self.update_vending_machine(channel, force_edit=force_edit, verify=verify)
+                    if result == "rate_limited":
+                        break
+                    # 실제 API 호출(edit/send)이 있었을 때만 간격 유지 (스킵이면 즉시 다음 채널)
+                    if result == "updated" and i < len(channels) - 1:
+                        await asyncio.sleep(2.0)
+                except Exception as e:
+                    logger.error(f"Refresh vending machine error: {e}")
+            logger.info("[VENDING] Vending machines refreshed")
     
-    async def send_stock_notice(self, product, key_count):
+    async def send_stock_notice(self, product, key_count, total_stock=None):
         """재고(키) 입고 시 입고 채널에 공지 전송"""
         stock_channel_id = db.get_setting('stock_channel_id', '')
         if not stock_channel_id:
             return
-        
+
         try:
             channel = self.get_channel(int(stock_channel_id))
             if channel:
-                total_stock = db.count_available_keys(product['id'])
+                if total_stock is None:
+                    total_stock = db.count_available_keys(product['id'])
                 embed = discord.Embed(
                     title="📦 재고 입고 완료!",
                     description=f"**{product['name']}** 재고가 입고되었습니다!",
@@ -451,11 +821,49 @@ class VendingBot(commands.Bot):
                 )
                 embed.add_field(name="입고 수량", value=f"**+{key_count}개**", inline=True)
                 embed.add_field(name="현재 재고", value=f"**{total_stock}개**", inline=True)
-                embed.add_field(name="가격", value=f"**{product['price']:,}원**", inline=True)
+                embed.add_field(name="가격", value=format_price_text(product['price']), inline=True)
                 embed.set_footer(text="냥코 KEY 자판기 🐱 | 재고 입고 알림")
                 await channel.send(embed=embed)
         except Exception as e:
             logger.error(f"Stock notice error: {e}")
+
+    async def send_dm_broadcast(self, title, content, color_hex=None):
+        """전체 유저 DM 공지 발송 (대시보드에서 호출)
+
+        Returns: (성공 수, 실패 수, 전체 대상 수)
+        """
+        targets = db.get_notice_targets()
+        total = len(targets)
+        sent = 0
+        failed = 0
+        try:
+            color = discord.Color(int(str(color_hex).lstrip('#'), 16)) if color_hex else discord.Color.blurple()
+        except (TypeError, ValueError):
+            color = discord.Color.blurple()
+
+        for t in targets:
+            embed = discord.Embed(
+                title=str(title)[:256] or "📢 공지",
+                description=str(content)[:4000],
+                color=color
+            )
+            embed.set_footer(text="냥코 KEY 자판기 🐱 | 전체 공지")
+            try:
+                ok = await self.send_dm(t['user_id'], embed=embed)
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                failed += 1
+                logger.debug(f"[DM BROADCAST] 실패 ({t['user_id']}): {e}")
+            # DM 레이트리밋 방지용 간격
+            await asyncio.sleep(0.35)
+
+        db.add_audit_log('dm_broadcast', 'dashboard', 'dashboard',
+                         f"{title} (성공 {sent}/{total})")
+        logger.info(f"[DM BROADCAST] 완료: 성공 {sent}, 실패 {failed}, 전체 {total}")
+        return sent, failed, total
     
     async def send_notice(self, title, content, color_hex=None, image_file=None):
         """공지 임베드 전송 (대시보드 및 봇 명령에서 사용) - 이미지 파일 지원"""
@@ -526,17 +934,28 @@ class VendingMainView(ui.LayoutView):
         products = db.get_products(active_only=True)
         total_stock = sum(db.count_available_keys(p['id']) for p in products)
         status_text = f"-# 📦 등록 상품 **{len(products)}개** · 🔑 총 재고 **{total_stock}개** · 🟢 재고있음 🔴 품절"
-        
+        sale_text = db.sale_summary()
+
+        # 서버 커스텀 이모지 지원 (대시보드/명령어에서 설정한 값)
+        emoji_product = parse_button_emoji(db.get_setting('btn_emoji_product', '🎁')) or '🎁'
+        emoji_charge = parse_button_emoji(db.get_setting('btn_emoji_charge', '💰')) or '💰'
+        emoji_info = parse_button_emoji(db.get_setting('btn_emoji_info', 'ℹ️')) or 'ℹ️'
+        emoji_ticket = parse_button_emoji(db.get_setting('btn_emoji_ticket', '🎫')) or '🎫'
+
         children = [
             ui.TextDisplay(f"## {title}"),
             ui.TextDisplay(desc),
+        ]
+        if sale_text:
+            children.append(ui.TextDisplay(f"-# {sale_text}"))
+        children += [
             ui.TextDisplay("### 📂 카테고리 / 상품 선택"),
             ui.ActionRow(CategorySelect()),
             ui.ActionRow(
-                VendingButton(label="제품", emoji="🎁", style=discord.ButtonStyle.primary, custom_id="vending_products"),
-                VendingButton(label="충전", emoji="💰", style=discord.ButtonStyle.success, custom_id="vending_charge"),
-                VendingButton(label="정보", emoji="ℹ️", style=discord.ButtonStyle.secondary, custom_id="vending_info"),
-                VendingButton(label="문의", emoji="🎫", style=discord.ButtonStyle.danger, custom_id="vending_ticket"),
+                VendingButton(label="제품", emoji=emoji_product, style=discord.ButtonStyle.primary, custom_id="vending_products"),
+                VendingButton(label="충전", emoji=emoji_charge, style=discord.ButtonStyle.success, custom_id="vending_charge"),
+                VendingButton(label="정보", emoji=emoji_info, style=discord.ButtonStyle.secondary, custom_id="vending_info"),
+                VendingButton(label="문의", emoji=emoji_ticket, style=discord.ButtonStyle.danger, custom_id="vending_ticket"),
             ),
             ui.TextDisplay(status_text),
             ui.TextDisplay(f"-# {footer}"),
@@ -562,20 +981,27 @@ class CategorySelect(discord.ui.Select):
         products = db.get_products(active_only=True)
         
         options = []
+        cat_emoji = parse_button_emoji(db.get_setting('btn_emoji_category', '📂')) or '📂'
         if categories:
             for cat in categories[:24]:
                 cat_count = len(db.get_products_by_category(cat, active_only=True))
                 options.append(discord.SelectOption(
-                    label=cat,
+                    label=cat[:100],
                     description=f"{cat_count}개 상품",
-                    emoji="📂"
+                    emoji=cat_emoji
                 ))
         else:
             for p in products[:24]:
                 stock = db.count_available_keys(p['id'])
+                final_price, sale_discount = db.apply_sale(p['price'])
+                price_tag = f"🔥{final_price:,}원" if sale_discount > 0 else f"{final_price:,}원"
+                desc_line = (p.get('description') or '').strip().replace('\n', ' ')
+                detail = f"재고: {stock}개"
+                if desc_line:
+                    detail = f"{detail} · {desc_line}"
                 options.append(discord.SelectOption(
-                    label=f"{p['name']} ({p['price']:,}원)",
-                    description=f"재고: {stock}개",
+                    label=f"{p['name']} ({price_tag})"[:100],
+                    description=detail[:100],
                     value=str(p['id']),
                     emoji="🛒"
                 ))
@@ -612,20 +1038,25 @@ class CategorySelect(discord.ui.Select):
                 return
             
             balance = db.get_balance(str(interaction.user.id))
-            
+            sale_text = db.sale_summary()
+            embed_desc = f"구매할 상품을 선택하세요!\n\n💰 현재 포인트: **{balance:,}원**"
+            if sale_text:
+                embed_desc += f"\n{sale_text}"
             embed = discord.Embed(
                 title=f"📂 {selected}",
-                description=f"구매할 상품을 선택하세요!\n\n💰 현재 포인트: **{balance:,}원**",
+                description=embed_desc,
                 color=discord.Color.blurple()
             )
             for p in cat_products:
                 stock = db.count_available_keys(p['id'])
                 icon = '🟢' if stock > 0 else '🔴'
-                embed.add_field(
-                    name=p['name'],
-                    value=f"{icon} **{p['price']:,}원** · 재고 {stock}개\n{p.get('description', '')}",
-                    inline=False
-                )
+                final_price, sale_discount = db.apply_sale(p['price'])
+                price_line = format_price_text(p['price'])
+                desc_line = (p.get('description') or '').strip()
+                value = f"{icon} {price_line} · 재고 {stock}개"
+                if desc_line:
+                    value += f"\n{desc_line}"
+                embed.add_field(name=p['name'], value=value, inline=False)
             
             await interaction.response.send_message(embed=embed, view=BuyProductView(cat_products), ephemeral=True)
         else:
@@ -647,15 +1078,21 @@ class CategorySelect(discord.ui.Select):
                 return
             
             balance = db.get_balance(str(interaction.user.id))
-            if balance < product['price']:
+            final_price, sale_discount = db.apply_sale(product['price'])
+            if balance < final_price:
                 await interaction.response.send_message(
-                    f"❌ 포인트가 부족합니다!\n필요: {product['price']:,}포인트 | 보유: {balance:,}포인트\n\n💰 **충전** 버튼을 눌러 충전해주세요!",
+                    f"❌ 포인트가 부족합니다!\n필요: {final_price:,}포인트 | 보유: {balance:,}포인트\n\n💰 **충전** 버튼을 눌러 충전해주세요!",
                     ephemeral=True
                 )
                 return
-            
+
+            detail = (product.get('description') or '').strip()
+            detail_text = f"\n📝 {detail}\n" if detail else ""
+            sale_line = f"\n🔥 전체 할인 적용: ~~{product['price']:,}원~~ → **{final_price:,}원**" if sale_discount > 0 else ""
             await interaction.response.send_message(
-                f"✅ **{product['name']}** - {product['price']:,}포인트\n\n"
+                f"✅ **{product['name']}**"
+                f"{detail_text}{sale_line}\n\n"
+                f"💳 결제 금액: **{final_price:,}포인트**\n\n"
                 f"구매를 진행하시겠습니까?\n"
                 f"🎟️ 쿠폰이 있다면 **쿠폰 사용** 버튼을 눌러 할인받으세요! (없으면 바로 구매 확정)",
                 view=ConfirmBuyView(product),
@@ -693,46 +1130,38 @@ class VendingButton(discord.ui.Button):
         if not products:
             embed.add_field(name="⚠️ 상품 준비중", value="곧 상품이 등록됩니다!", inline=False)
         else:
+            sale_text = db.sale_summary()
+            if sale_text:
+                embed.add_field(name="🔥 진행중인 할인", value=sale_text, inline=False)
+
+            def _line(p):
+                stock = db.count_available_keys(p['id'])
+                stock_text = f"{stock}개" if stock > 0 else "품절"
+                desc = (p.get('description') or '').strip().replace('\n', ' ')
+                suffix = f" · {desc}" if desc else ""
+                return f"• {p['name']} - {format_price_text(p['price'])} (재고: {stock_text}){suffix}"
+
             # 카테고리 사용 여부 확인
             use_categories = db.get_setting('use_categories', 'false').lower() == 'true'
-            if use_categories:
+            categories = db.get_categories() if use_categories else []
+            if use_categories and categories:
                 # 카테고리별로 그룹화하여 표시
-                categories = db.get_categories()
-                if categories:
-                    for cat in categories:
-                        cat_products = db.get_products_by_category(cat, active_only=True)
-                        if not cat_products:
-                            continue
-                        lines = []
-                        for p in cat_products:
-                            stock = db.count_available_keys(p['id'])
-                            stock_text = f"{stock}개" if stock > 0 else "품절"
-                            lines.append(f"• {p['name']} - **{p['price']:,}원** (재고: {stock_text})")
-                        embed.add_field(name=f"📂 {cat}", value="\n".join(lines), inline=False)
-                    # 카테고리 없는 상품
-                    no_cat = [p for p in products if not p.get('category')]
-                    if no_cat:
-                        lines = []
-                        for p in no_cat:
-                            stock = db.count_available_keys(p['id'])
-                            stock_text = f"{stock}개" if stock > 0 else "품절"
-                            lines.append(f"• {p['name']} - **{p['price']:,}원** (재고: {stock_text})")
-                        embed.add_field(name="📦 기타", value="\n".join(lines), inline=False)
-                else:
-                    # 카테고리가 없으면 전체 표시
-                    for p in products:
-                        stock = db.count_available_keys(p['id'])
-                        embed.add_field(
-                            name=f"{p['name']} - {p['price']:,}원",
-                            value=f"{p['description']}\n재고: {stock}개",
-                            inline=False
-                        )
+                for cat in categories:
+                    cat_products = db.get_products_by_category(cat, active_only=True)
+                    if not cat_products:
+                        continue
+                    embed.add_field(name=f"📂 {cat}", value="\n".join(_line(p) for p in cat_products)[:1024], inline=False)
+                # 카테고리 없는 상품
+                no_cat = [p for p in products if not p.get('category')]
+                if no_cat:
+                    embed.add_field(name="📦 기타", value="\n".join(_line(p) for p in no_cat)[:1024], inline=False)
             else:
-                for p in products:
+                for p in products[:20]:
                     stock = db.count_available_keys(p['id'])
+                    desc = (p.get('description') or '').strip() or "설명 없음"
                     embed.add_field(
-                        name=f"{p['name']} - {p['price']:,}원",
-                        value=f"{p['description']}\n재고: {stock}개",
+                        name=f"{p['name']} - {format_price_text(p['price'])}",
+                        value=f"{desc[:200]}\n재고: {stock}개",
                         inline=False
                     )
         
@@ -769,49 +1198,48 @@ class VendingButton(discord.ui.Button):
         
         # Check balance
         balance = db.get_balance(str(interaction.user.id))
-        
+
+        sale_text = db.sale_summary()
+        embed_desc = f"구매할 상품을 선택하세요!\n\n💰 현재 포인트: **{balance:,}원**"
+        if sale_text:
+            embed_desc += f"\n{sale_text}"
         embed = discord.Embed(
             title="🛒 상품 구매",
-            description=f"구매할 상품을 선택하세요!\n\n💰 현재 포인트: **{balance:,}원**",
+            description=embed_desc,
             color=discord.Color.blue()
         )
-        
+
+        def _line(p):
+            return (f"• {p['name']} - {format_price_text(p['price'])} "
+                    f"(재고: {db.count_available_keys(p['id'])}개)")
+
         # 카테고리 사용 여부 확인
         use_categories = db.get_setting('use_categories', 'false').lower() == 'true'
-        
-        if use_categories:
-            categories = db.get_categories()
-            if categories:
-                for cat in categories:
-                    cat_products = db.get_products_by_category(cat, active_only=True)
-                    if not cat_products:
-                        continue
-                    embed.add_field(
-                        name=f"📂 {cat}",
-                        value="\n".join([f"• {p['name']} - **{p['price']:,}원** (재고: {db.count_available_keys(p['id'])}개)" for p in cat_products]),
-                        inline=False
-                    )
-                # 카테고리 없는 상품
-                no_cat = [p for p in products if not p.get('category')]
-                if no_cat:
-                    embed.add_field(
-                        name="📦 기타",
-                        value="\n".join([f"• {p['name']} - **{p['price']:,}원** (재고: {db.count_available_keys(p['id'])}개)" for p in no_cat]),
-                        inline=False
-                    )
-            else:
-                for p in products:
-                    stock = db.count_available_keys(p['id'])
-                    embed.add_field(
-                        name=f"{p['name']} - {p['price']:,}원",
-                        value=f"재고: {stock}개",
-                        inline=False
-                    )
+        categories = db.get_categories() if use_categories else []
+
+        if use_categories and categories:
+            for cat in categories:
+                cat_products = db.get_products_by_category(cat, active_only=True)
+                if not cat_products:
+                    continue
+                embed.add_field(
+                    name=f"📂 {cat}",
+                    value="\n".join(_line(p) for p in cat_products)[:1024],
+                    inline=False
+                )
+            # 카테고리 없는 상품
+            no_cat = [p for p in products if not p.get('category')]
+            if no_cat:
+                embed.add_field(
+                    name="📦 기타",
+                    value="\n".join(_line(p) for p in no_cat)[:1024],
+                    inline=False
+                )
         else:
-            for p in products:
+            for p in products[:20]:
                 stock = db.count_available_keys(p['id'])
                 embed.add_field(
-                    name=f"{p['name']} - {p['price']:,}원",
+                    name=f"{p['name']} - {format_price_text(p['price'])}",
                     value=f"재고: {stock}개",
                     inline=False
                 )
@@ -1290,40 +1718,50 @@ class BuyProductView(discord.ui.View):
 class BuyButton(discord.ui.Button):
     def __init__(self, product, row=0):
         stock = db.count_available_keys(product['id'])
+        final_price, sale_discount = db.apply_sale(product['price'])
         disabled = stock <= 0 or not product['active']
-        label = f"{product['name']} - {product['price']:,}원"
+        label = f"{product['name']} - {final_price:,}원"
+        if sale_discount > 0:
+            label = f"🔥 {product['name']} - {final_price:,}원"
         if stock <= 0:
             label = f"{product['name']} (품절)"
         super().__init__(
-            label=label,
+            label=label[:80],
             style=discord.ButtonStyle.primary if stock > 0 else discord.ButtonStyle.secondary,
             custom_id=f"buy_confirm_{product['id']}",
             disabled=disabled,
             row=row
         )
         self.product = product
-    
+
     async def callback(self, interaction: discord.Interaction):
+        final_price, sale_discount = db.apply_sale(self.product['price'])
+
         # Check balance
         balance = db.get_balance(str(interaction.user.id))
-        if balance < self.product['price']:
+        if balance < final_price:
             await interaction.response.send_message(
                 f"❌ 포인트가 부족합니다!\n"
-                f"필요: {self.product['price']:,}포인트 | 보유: {balance:,}포인트\n\n"
+                f"필요: {final_price:,}포인트 | 보유: {balance:,}포인트\n\n"
                 f"💰 **충전** 버튼을 눌러 포인트를 충전해주세요!",
                 ephemeral=True
             )
             return
-        
+
         # Check stock
         stock = db.count_available_keys(self.product['id'])
         if stock <= 0:
             await interaction.response.send_message("❌ 재고가 소진되었습니다.", ephemeral=True)
             return
-        
+
         # Confirm purchase
+        detail = (self.product.get('description') or '').strip()
+        detail_text = f"\n📝 {detail}\n" if detail else ""
+        sale_line = (f"\n🔥 전체 할인: ~~{self.product['price']:,}원~~ → **{final_price:,}원**"
+                     if sale_discount > 0 else "")
         await interaction.response.send_message(
-            f"✅ **{self.product['name']}** - {self.product['price']:,}포인트\n\n"
+            f"✅ **{self.product['name']}**{detail_text}{sale_line}\n\n"
+            f"💳 결제 금액: **{final_price:,}포인트**\n\n"
             f"구매를 진행하시겠습니까?\n"
             f"🎟️ 쿠폰이 있다면 **쿠폰 사용** 버튼을 눌러 할인받으세요! (없으면 바로 구매 확정)",
             view=ConfirmBuyView(self.product),
@@ -1362,75 +1800,107 @@ class ConfirmBuyButton(discord.ui.Button):
         self.is_confirm = confirm
         self.coupon = coupon
     
+    def price_breakdown(self):
+        """(원가, 전체할인 적용가, 전체할인액, 쿠폰할인액, 최종 결제금액)"""
+        base = max(0, int(self.product['price']))
+        sale_price, sale_discount = db.apply_sale(base)
+        coupon_discount = db.coupon_discount_amount(self.coupon, sale_price) if self.coupon else 0
+        return base, sale_price, sale_discount, coupon_discount, max(0, sale_price - coupon_discount)
+
     def get_final_price(self):
-        """쿠폰 할인이 적용된 최종 가격"""
-        price = self.product['price']
-        if self.coupon:
-            price = max(0, price - self.coupon['discount_amount'])
-        return price
-    
+        """전체 할인 + 쿠폰 할인이 모두 적용된 최종 가격"""
+        return self.price_breakdown()[4]
+
     async def callback(self, interaction: discord.Interaction):
         if not self.is_confirm:
-            await interaction.response.edit_message(content="❌ 구매가 취소되었습니다.", embed=None, view=None)
+            await interaction.response.edit_message(content="❌ 구매가 취소되었습니다.", view=None)
             return
-        
-        # Double check balance and stock (쿠폰 할인 적용 가격 기준)
-        final_price = self.get_final_price()
-        balance = db.get_balance(str(interaction.user.id))
+
+        bot = interaction.client
+        # 같은 유저의 중복 클릭(연타)으로 인한 이중 결제 방지
+        lock = bot._purchase_locks.setdefault(interaction.user.id, asyncio.Lock())
+        if lock.locked():
+            await interaction.response.send_message("⏳ 이미 구매를 처리 중입니다. 잠시만 기다려주세요.", ephemeral=True)
+            return
+
+        async with lock:
+            await interaction.response.defer()
+            try:
+                await self._process_purchase(interaction)
+            except Exception as e:
+                logger.error(f"Purchase error: {e}")
+                await interaction.edit_original_response(
+                    content="❌ 구매 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.\n"
+                            "(포인트가 차감되었는데 KEY를 받지 못했다면 관리자에게 문의해주세요.)",
+                    view=None
+                )
+
+    async def _process_purchase(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        base, sale_price, sale_discount, coupon_discount, final_price = self.price_breakdown()
+
+        # Double check balance and stock (전체할인 + 쿠폰 할인 적용 가격 기준)
+        balance = db.get_balance(user_id)
         if balance < final_price:
-            await interaction.response.edit_message(
-                content=f"❌ 포인트가 부족합니다! (부족액: {final_price - balance:,}포인트)",
-                embed=None, view=None
-            )
+            await interaction.edit_original_response(
+                content=f"❌ 포인트가 부족합니다! (부족액: {final_price - balance:,}포인트)", view=None)
+            return
+
+        if db.count_available_keys(self.product['id']) <= 0:
+            await interaction.edit_original_response(content="❌ 재고가 소진되었습니다.", view=None)
             return
         
-        stock = db.count_available_keys(self.product['id'])
-        if stock <= 0:
-            await interaction.response.edit_message(content="❌ 재고가 소진되었습니다.", embed=None, view=None)
-            return
-        
-        # Deduct balance (쿠폰 할인 적용)
-        coupon_desc = f" (쿠폰 {self.coupon['code']} -{self.coupon['discount_amount']:,})" if self.coupon else ""
-        success = db.deduct_balance(
-            str(interaction.user.id),
-            final_price,
-            trans_type='purchase',
-            description=f"{self.product['name']} 구매{coupon_desc}"
-        )
-        
-        if not success:
-            await interaction.response.edit_message(content="❌ 결제에 실패했습니다.", embed=None, view=None)
-            return
-        
-        # Create order and complete immediately (points purchase = instant)
+        # 주문 생성 → 키 원자적 선점 (동시 구매 시 같은 키가 중복 지급되는 것 방지)
         order_id = db.create_order(
-            str(interaction.user.id),
+            user_id,
             interaction.user.name,
             self.product['id'],
             self.product['name'],
             final_price
         )
-        
-        # Get key and complete
-        key = db.get_available_key(self.product['id'])
+        key = db.claim_key(self.product['id'], order_id)
         if not key:
-            # Refund
-            db.add_balance(str(interaction.user.id), interaction.user.name, final_price, 'refund', '재고 소진 환불')
             db.update_order_status(order_id, 'cancelled')
-            await interaction.response.edit_message(content="❌ 재고가 소진되어 환불되었습니다.", embed=None, view=None)
+            await interaction.edit_original_response(
+                content="❌ 재고가 소진되었습니다. (다른 구매가 먼저 처리되었습니다)", view=None)
             return
-        
-        conn = db.get_conn()
-        c = conn.cursor()
-        c.execute('UPDATE keys SET used=1, order_id=? WHERE id=?', (order_id, key['id']))
-        conn.commit()
-        conn.close()
-        
-        db.update_order_status(order_id, 'completed', key_id=key['id'])
-        
-        # 쿠폰 사용 처리 (사용 횟수 +1)
+
+        # Deduct balance (전체 할인 + 쿠폰 할인 적용, 0원 결제도 정상 처리)
+        desc_parts = []
+        if sale_discount > 0:
+            desc_parts.append(f"할인 -{sale_discount:,}")
         if self.coupon:
-            db.use_coupon(self.coupon['id'])
+            desc_parts.append(f"쿠폰 {self.coupon['code']} -{coupon_discount:,}")
+        coupon_desc = f" ({', '.join(desc_parts)})" if desc_parts else ""
+        paid = db.deduct_balance(
+            user_id,
+            final_price,
+            trans_type='purchase',
+            description=f"{self.product['name']} 구매{coupon_desc}",
+            username=interaction.user.name
+        )
+
+        if not paid:
+            db.release_key(key['id'])
+            db.update_order_status(order_id, 'cancelled')
+            await interaction.edit_original_response(content="❌ 결제에 실패했습니다. 잔액을 확인해주세요.", view=None)
+            return
+
+        # 쿠폰 사용 처리 (동시 사용으로 한도가 소진되면 자동 환불)
+        if self.coupon and not db.use_coupon(self.coupon['id'], user_id=user_id,
+                                             order_id=order_id, discount=coupon_discount):
+            db.add_balance(user_id, interaction.user.name, final_price, 'refund', '쿠폰 동시 사용 실패 자동 환불')
+            db.release_key(key['id'])
+            db.update_order_status(order_id, 'cancelled')
+            await interaction.edit_original_response(
+                content="❌ 쿠폰 사용 한도가 방금 소진되었습니다.\n결제 금액은 자동 환불되었습니다. 쿠폰 없이 다시 구매해주세요.",
+                view=None
+            )
+            return
+
+        db.update_order_status(order_id, 'completed', key_id=key['id'])
+        db.add_audit_log('purchase', user_id, interaction.user.name,
+                         f"#{order_id} {self.product['name']} {final_price:,}P")
         
         # Send key via DM (customizable message)
         dm_title = db.get_setting('purchase_dm_title', '✅ 구매 완료!')
@@ -1444,29 +1914,41 @@ class ConfirmBuyButton(discord.ui.Button):
         )
         embed.add_field(name="주문번호", value=f"#{order_id}", inline=True)
         embed.add_field(name="상품", value=self.product['name'], inline=True)
+        if sale_discount > 0:
+            embed.add_field(name="원래 가격", value=f"~~{base:,}포인트~~", inline=True)
+            embed.add_field(name=f"🔥 할인 ({db.sale_label_text()})", value=f"-{sale_discount:,}포인트", inline=True)
+        elif self.coupon:
+            embed.add_field(name="원래 가격", value=f"{base:,}포인트", inline=True)
         if self.coupon:
-            embed.add_field(name="원래 가격", value=f"{self.product['price']:,}포인트", inline=True)
-            embed.add_field(name=f"🎟️ 할인 ({self.coupon['code']})", value=f"-{self.coupon['discount_amount']:,}포인트", inline=True)
+            embed.add_field(name=f"🎟️ 쿠폰 ({self.coupon['code']})", value=f"-{coupon_discount:,}포인트", inline=True)
         embed.add_field(name="결제금액", value=f"{final_price:,}포인트", inline=True)
         embed.add_field(name="🔑 KEY", value=f"```{key['key_value']}```", inline=False)
         embed.set_footer(text=dm_footer)
-        
-        await interaction.client.send_dm(interaction.user.id, embed=embed)
-        
-        new_balance = db.get_balance(str(interaction.user.id))
-        
-        discount_text = f"\n🎟️ 쿠폰 할인: -{self.coupon['discount_amount']:,}포인트 ({self.coupon['code']})" if self.coupon else ""
-        await interaction.response.edit_message(
+
+        dm_ok = await interaction.client.send_dm(interaction.user.id, embed=embed)
+        if not dm_ok:
+            db.add_audit_log('dm_failed', user_id, interaction.user.name,
+                             f"#{order_id} {self.product['name']} KEY DM 전송 실패")
+        dm_line = ("🔑 KEY가 DM으로 전송되었습니다!" if dm_ok
+                   else "⚠️ DM 전송에 실패했습니다. 디스코드 DM 설정을 확인하고 관리자에게 문의해주세요.")
+
+        new_balance = db.get_balance(user_id)
+
+        discount_lines = ""
+        if sale_discount > 0:
+            discount_lines += f"\n🔥 할인 적용: ~~{base:,}~~ → {sale_price:,}포인트 (-{sale_discount:,})"
+        if self.coupon:
+            discount_lines += f"\n🎟️ 쿠폰 할인: -{coupon_discount:,}포인트 ({self.coupon['code']})"
+        await interaction.edit_original_response(
             content=f"✅ **구매 완료!**\n\n"
                    f"📦 상품: {self.product['name']}\n"
-                   f"💰 사용 포인트: {final_price:,}포인트{discount_text}\n"
+                   f"💰 사용 포인트: {final_price:,}포인트{discount_lines}\n"
                    f"💳 남은 포인트: {new_balance:,}포인트\n"
-                   f"🔑 KEY가 DM으로 전송되었습니다!",
-            embed=None, view=None
+                   f"{dm_line}",
+            view=None
         )
         
         # Send purchase log to purchase log channel
-        from datetime import datetime
         purchase_log_channel_id = db.get_setting('purchase_log_channel_id', '')
         if purchase_log_channel_id and interaction.client.is_ready():
             try:
@@ -1481,8 +1963,10 @@ class ConfirmBuyButton(discord.ui.Button):
                     embed_log.add_field(name="주문번호", value=f"#{order_id}", inline=True)
                     embed_log.add_field(name="구매자", value=f"{interaction.user.mention} ({interaction.user.name})", inline=True)
                     embed_log.add_field(name="상품", value=self.product['name'], inline=True)
+                    if sale_discount > 0:
+                        embed_log.add_field(name="전체 할인", value=f"-{sale_discount:,} (원가 {base:,})", inline=True)
                     if self.coupon:
-                        embed_log.add_field(name="쿠폰 할인", value=f"{self.coupon['code']} (-{self.coupon['discount_amount']:,})", inline=True)
+                        embed_log.add_field(name="쿠폰 할인", value=f"{self.coupon['code']} (-{coupon_discount:,})", inline=True)
                     embed_log.add_field(name="결제 금액", value=f"{final_price:,}포인트", inline=True)
                     embed_log.add_field(name="구매 시간", value=datetime.now().strftime('%Y-%m-%d %H:%M:%S'), inline=True)
                     embed_log.set_footer(text="🔑 키는 관리자 패널에서 확인하세요")
@@ -1549,18 +2033,113 @@ class CouponModal(discord.ui.Modal):
             )
             return
         
-        discount = coupon['discount_amount']
-        final_price = max(0, self.product['price'] - discount)
-        
-        content = (
-            f"✅ **{self.product['name']}**\n\n"
-            f"💰 원래 가격: ~~{self.product['price']:,}포인트~~\n"
+        discount = db.coupon_discount_amount(coupon, db.apply_sale(self.product['price'])[0])
+        if discount <= 0:
+            await interaction.response.send_message(
+                "❌ 이 쿠폰은 해당 상품에 적용할 수 없습니다. (할인액이 0원)", ephemeral=True)
+            return
+
+        sale_price, sale_discount = db.apply_sale(self.product['price'])
+        final_price = max(0, sale_price - discount)
+
+        content = f"✅ **{self.product['name']}**\n\n"
+        if sale_discount > 0:
+            content += (f"🔥 전체 할인: ~~{self.product['price']:,}포인트~~ → {sale_price:,}포인트\n")
+        content += (
             f"🎟️ 쿠폰 할인: **-{discount:,}포인트** ({coupon['code']})\n"
             f"💳 결제 금액: **{final_price:,}포인트**\n\n"
             f"구매를 진행하시겠습니까?"
         )
-        
+
         await interaction.response.edit_message(content=content, view=ConfirmBuyView(self.product, coupon))
+
+
+class BulkPointsConfirmView(discord.ui.View):
+    """전체 포인트 지급/차감 실행 확인 뷰"""
+    def __init__(self, kind, amount):
+        super().__init__(timeout=60)
+        self.kind = kind    # 'add' 또는 'remove'
+        self.amount = amount
+        self.add_item(BulkPointsConfirmButton(confirm=True))
+        self.add_item(BulkPointsConfirmButton(confirm=False))
+
+
+class BulkPointsConfirmButton(discord.ui.Button):
+    """전체 포인트 지급/차감 실행 버튼"""
+    def __init__(self, confirm):
+        if confirm:
+            super().__init__(
+                label="✅ 실행",
+                style=discord.ButtonStyle.success,
+                custom_id="bulk_points_confirm_yes",
+                row=0
+            )
+        else:
+            super().__init__(
+                label="❌ 취소",
+                style=discord.ButtonStyle.secondary,
+                custom_id="bulk_points_confirm_no",
+                row=0
+            )
+        self.confirm = confirm
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not view or view.amount <= 0:
+            await interaction.response.edit_message(content="❌ 유효하지 않은 요청입니다.", embed=None, view=None)
+            return
+
+        # 안전장치: 관리자만 실행 가능 (버튼은 명령 실행자에게만 보이지만 이중 확인)
+        if not db.is_admin(str(interaction.user.id)):
+            await interaction.response.send_message("❌ 관리자만 실행할 수 있습니다.", ephemeral=True)
+            return
+
+        if not self.confirm:
+            await interaction.response.edit_message(content="❌ 취소되었습니다.", embed=None, view=None)
+            return
+
+        # 대량 유저 처리 시 3초 제한 초과를 피하기 위해 defer 후 followup으로 처리
+        await interaction.response.defer()
+
+        amount = view.amount
+        kind = view.kind
+        try:
+            if kind == 'add':
+                affected = db.add_balance_all(
+                    amount,
+                    trans_type='admin_add',
+                    description=f"관리자 {interaction.user.name}님이 전체 지급 {amount:,}포인트"
+                )
+                embed = discord.Embed(
+                    title="✅ 전체 포인트 지급 완료",
+                    description=f"**{affected}명**의 유저에게 각각 **{amount:,}포인트**가 지급되었습니다!",
+                    color=discord.Color.green()
+                )
+            elif kind == 'remove':
+                affected, total_deducted = db.deduct_balance_all(
+                    amount,
+                    trans_type='admin_remove',
+                    description=f"관리자 {interaction.user.name}님이 전체 차감 {amount:,}포인트"
+                )
+                desc = f"**{affected}명**의 유저에게서 총 **{total_deducted:,}포인트**가 차감되었습니다."
+                if amount > total_deducted:
+                    desc += "\n(잔액이 부족한 유저는 보유 잔액까지만 차감되었습니다)"
+                embed = discord.Embed(
+                    title="✅ 전체 포인트 차감 완료",
+                    description=desc,
+                    color=discord.Color.green()
+                )
+            else:
+                await interaction.followup.edit_message(content="❌ 잘못된 작업입니다.", embed=None, view=None)
+                return
+            embed.set_footer(text=f"실행자: {interaction.user.name}")
+            await interaction.followup.edit_message(embed=embed, view=None)
+        except Exception as e:
+            logger.error(f"Bulk points execute error: {e}")
+            await interaction.followup.edit_message(
+                content=f"❌ 실행 중 오류가 발생했습니다: {e}",
+                embed=None, view=None
+            )
 
 
 class VendingCommands(commands.Cog):
@@ -1607,7 +2186,7 @@ class VendingCommands(commands.Cog):
             return
         
         await interaction.response.defer(ephemeral=True)
-        await self.bot.refresh_vending_machines()
+        await self.bot.refresh_vending_machines(force_edit=True)
         await interaction.followup.send("✅ 자판기가 새로고침되었습니다!", ephemeral=True)
     
     @app_commands.command(name="포인트지급", description="[관리자] 유저에게 포인트를 지급합니다")
@@ -1626,6 +2205,8 @@ class VendingCommands(commands.Cog):
             trans_type='admin_add',
             description=f"관리자 {interaction.user.name}님이 {amount:,}포인트 지급"
         )
+        db.add_audit_log('grant_points', str(interaction.user.id), interaction.user.name,
+                         f"{user.name}({user.id}) +{amount:,}P → 잔액 {new_balance:,}P")
         
         # Notify user via DM
         embed = discord.Embed(
@@ -1672,6 +2253,62 @@ class VendingCommands(commands.Cog):
             f"현재 잔액: {new_balance:,}포인트",
             ephemeral=True
         )
+    
+    @app_commands.command(name="전체포인트지급", description="[관리자] 등록된 모든 유저에게 동일한 포인트를 지급합니다")
+    @app_commands.describe(amount="모든 유저에게 지급할 포인트 금액")
+    async def give_points_all(self, interaction: discord.Interaction, amount: int):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        if amount <= 0:
+            await interaction.response.send_message("❌ 0보다 큰 금액을 입력해주세요.", ephemeral=True)
+            return
+
+        total_users = len(db.get_users())
+        if total_users == 0:
+            await interaction.response.send_message("❌ 등록된 유저가 없습니다. 먼저 유저가 봇을 사용해야 합니다.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="💰 전체 포인트 지급 확인",
+            description=(
+                f"**{total_users}명**의 모든 유저에게 각각 **{amount:,}포인트**를 지급합니다.\n"
+                f"총 지급 예정: **{total_users * amount:,}포인트**\n\n"
+                f"정말 실행하시겠습니까?"
+            ),
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="이 버튼은 실행한 관리자만 볼 수 있습니다")
+        await interaction.response.send_message(embed=embed, view=BulkPointsConfirmView('add', amount), ephemeral=True)
+    
+    @app_commands.command(name="전체포인트차감", description="[관리자] 등록된 모든 유저의 포인트를 동일하게 차감합니다")
+    @app_commands.describe(amount="모든 유저에게서 차감할 포인트 금액")
+    async def remove_points_all(self, interaction: discord.Interaction, amount: int):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        if amount <= 0:
+            await interaction.response.send_message("❌ 0보다 큰 금액을 입력해주세요.", ephemeral=True)
+            return
+
+        total_users = len(db.get_users())
+        if total_users == 0:
+            await interaction.response.send_message("❌ 등록된 유저가 없습니다. 먼저 유저가 봇을 사용해야 합니다.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="⚠️ 전체 포인트 차감 확인",
+            description=(
+                f"**{total_users}명**의 모든 유저에게서 각각 **{amount:,}포인트**를 차감합니다.\n"
+                f"(잔액이 **0 미만으로 내려가지는 않습니다**)\n\n"
+                f"정말 실행하시겠습니까?"
+            ),
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text="이 버튼은 실행한 관리자만 볼 수 있습니다")
+        await interaction.response.send_message(embed=embed, view=BulkPointsConfirmView('remove', amount), ephemeral=True)
     
     @app_commands.command(name="잔액확인", description="[관리자] 유저의 포인트 잔액을 확인합니다")
     @app_commands.describe(user="잔액을 확인할 유저")
@@ -1784,13 +2421,21 @@ class VendingCommands(commands.Cog):
             return
         
         key_list = [k.strip() for k in keys.split('\n') if k.strip()]
-        db.add_keys(product_id, key_list)
+        added = db.add_keys(product_id, key_list)
+        total_stock = db.count_available_keys(product_id)
+        # 입고 기록 (대시보드와 동일한 stock_logs 테이블 공유)
+        if added > 0:
+            db.log_stock(product_id, product['name'], added, total_stock,
+                         source='discord',
+                         actor=f"{interaction.user.name}#{interaction.user.id}")
         await interaction.response.send_message(
-            f"✅ **{product['name']}**에 키 {len(key_list)}개가 추가되었습니다!", ephemeral=True)
+            f"✅ **{product['name']}**에 키 {added}개가 추가되었습니다!\n"
+            f"📦 현재 재고: **{total_stock}개**", ephemeral=True)
         await self.bot.refresh_vending_machines()
-        
+
         # 입고 채널에 공지 전송
-        await self.bot.send_stock_notice(product, len(key_list))
+        if added > 0:
+            await self.bot.send_stock_notice(product, added, total_stock=total_stock)
     
     @app_commands.command(name="카테고리토글", description="[관리자] 카테고리 사용 여부를 전환합니다")
     @app_commands.describe(enabled="사용 여부 (true/false)")

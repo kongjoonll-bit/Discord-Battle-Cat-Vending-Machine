@@ -7,9 +7,21 @@ from datetime import datetime
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'vending.db')
 
 def get_conn():
+    """SQLite 연결 생성 (동시성/안정성 강화)
+
+    - timeout/busy_timeout: 봇 스레드와 Flask 스레드가 동시에 접근해도
+      'database is locked' 로 죽지 않도록 대기 시간을 준다.
+    - WAL: 읽기/쓰기 동시성 향상 (오래 켜두면 필수)
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute('PRAGMA busy_timeout=30000')
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=NORMAL')
+    except sqlite3.DatabaseError:
+        pass
     return conn
 
 def init_db():
@@ -134,12 +146,66 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT UNIQUE NOT NULL,
         discount_amount INTEGER NOT NULL,
+        discount_type TEXT DEFAULT 'amount',  -- amount = 정액, percent = 정률(%)
         max_uses INTEGER DEFAULT 0,  -- 0 = 무제한
         used_count INTEGER DEFAULT 0,
         active INTEGER DEFAULT 1,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
-    
+
+    # 기존 DB 마이그레이션: 쿠폰 할인 방식 컬럼 보장
+    try:
+        c.execute("ALTER TABLE coupons ADD COLUMN discount_type TEXT DEFAULT 'amount'")
+    except Exception:
+        pass  # 이미 존재
+
+    # 재고(입고) 로그 테이블 - '입고 로그가 안 뜨는' 문제 해결용
+    c.execute('''CREATE TABLE IF NOT EXISTS stock_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        product_name TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        total_stock INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'dashboard',  -- dashboard / command / bot
+        actor TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # 감사 로그 (관리자 행동 추적 - 보안)
+    c.execute('''CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        actor_id TEXT DEFAULT '',
+        actor_name TEXT DEFAULT '',
+        detail TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # 쿠폰 사용 기록 (누가 어떤 쿠폰으로 얼마 할인받았는지)
+    c.execute('''CREATE TABLE IF NOT EXISTS coupon_uses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coupon_id INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        order_id INTEGER DEFAULT NULL,
+        discount INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # 성능 인덱스 (데이터가 쌓여도 느려지지 않게)
+    for _sql in (
+        'CREATE INDEX IF NOT EXISTS idx_keys_product_used ON keys(product_id, used)',
+        'CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)',
+        'CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_charge_status ON charge_requests(status)',
+        'CREATE INDEX IF NOT EXISTS idx_stock_logs_created ON stock_logs(created_at)',
+    ):
+        try:
+            c.execute(_sql)
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
 
@@ -249,12 +315,19 @@ def delete_product(pid):
 
 # ============ KEYS ============
 def add_keys(product_id, key_list):
+    """키 여러 개 추가 (추가된 개수 반환)"""
     conn = get_conn()
     c = conn.cursor()
+    added = 0
     for k in key_list:
-        c.execute('INSERT INTO keys (product_id, key_value) VALUES (?, ?)', (product_id, k.strip()))
+        k = str(k).strip()
+        if not k:
+            continue
+        c.execute('INSERT INTO keys (product_id, key_value) VALUES (?, ?)', (product_id, k))
+        added += 1
     conn.commit()
     conn.close()
+    return added
 
 def get_available_key(product_id):
     conn = get_conn()
@@ -263,6 +336,42 @@ def get_available_key(product_id):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
+
+def claim_key(product_id, order_id):
+    """키를 원자적으로 선점(지급)한다 - 동시 구매 시 같은 키가 중복 지급되는 것 방지
+
+    Returns: 선점한 키 dict 또는 None(재고 없음)
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        for _ in range(5):
+            c.execute('SELECT * FROM keys WHERE product_id=? AND used=0 ORDER BY id LIMIT 1', (product_id,))
+            row = c.fetchone()
+            if not row:
+                return None
+            c.execute('UPDATE keys SET used=1, order_id=? WHERE id=? AND used=0', (order_id, row['id']))
+            conn.commit()
+            if c.rowcount:
+                return dict(row)
+        return None
+    finally:
+        conn.close()
+
+def release_key(key_id):
+    """선점한 키를 다시 판매 가능 상태로 되돌린다 (결제 실패/환불 시)
+
+    Returns: 되돌리기 성공 여부
+    """
+    if not key_id:
+        return False
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE keys SET used=0, order_id=NULL WHERE id=?', (int(key_id),))
+    ok = c.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
 
 def get_keys(product_id=None, used=None):
     conn = get_conn()
@@ -423,16 +532,22 @@ def get_total_revenue():
     return row['total'] if row else 0
 
 # ============ VENDING MACHINE ============
-def set_vending_message(channel_id, message_id):
-    """Save vending machine message location"""
+def set_vending_message(channel_id, message_id, content_hash=''):
+    """자판기 메시지 위치 저장 (content_hash: 메시지 내용이 안 바뀌면 edit을 생략하기 위한 서명)"""
     conn = get_conn()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS vending_messages (
         channel_id TEXT PRIMARY KEY,
-        message_id TEXT NOT NULL
+        message_id TEXT NOT NULL,
+        content_hash TEXT DEFAULT ''
     )''')
-    c.execute('INSERT OR REPLACE INTO vending_messages (channel_id, message_id) VALUES (?, ?)',
-              (str(channel_id), str(message_id)))
+    # 기존 DB에 content_hash 컬럼 추가 (마이그레이션)
+    try:
+        c.execute("ALTER TABLE vending_messages ADD COLUMN content_hash TEXT DEFAULT ''")
+    except Exception:
+        pass  # 이미 존재
+    c.execute('INSERT OR REPLACE INTO vending_messages (channel_id, message_id, content_hash) VALUES (?, ?, ?)',
+              (str(channel_id), str(message_id), content_hash or ''))
     conn.commit()
     conn.close()
 
@@ -442,8 +557,13 @@ def get_vending_message(channel_id):
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS vending_messages (
         channel_id TEXT PRIMARY KEY,
-        message_id TEXT NOT NULL
+        message_id TEXT NOT NULL,
+        content_hash TEXT DEFAULT ''
     )''')
+    try:
+        c.execute("ALTER TABLE vending_messages ADD COLUMN content_hash TEXT DEFAULT ''")
+    except Exception:
+        pass  # 이미 존재
     c.execute('SELECT * FROM vending_messages WHERE channel_id=?', (str(channel_id),))
     row = c.fetchone()
     conn.close()
@@ -455,8 +575,13 @@ def get_vending_channels():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS vending_messages (
         channel_id TEXT PRIMARY KEY,
-        message_id TEXT NOT NULL
+        message_id TEXT NOT NULL,
+        content_hash TEXT DEFAULT ''
     )''')
+    try:
+        c.execute("ALTER TABLE vending_messages ADD COLUMN content_hash TEXT DEFAULT ''")
+    except Exception:
+        pass  # 이미 존재
     c.execute('SELECT * FROM vending_messages')
     rows = c.fetchall()
     conn.close()
@@ -504,20 +629,87 @@ def add_balance(user_id, username, amount, trans_type='admin_add', description='
     conn.close()
     return new_balance
 
-def deduct_balance(user_id, amount, trans_type='purchase', description=''):
-    """Deduct balance from user"""
-    user = get_user(user_id)
-    if not user or user['balance'] < amount:
+def deduct_balance(user_id, amount, trans_type='purchase', description='', username=None):
+    """잔액 차감 (원자적)
+
+    - 예전 구현은 '잔액 조회 → 계산 → 덮어쓰기' 라서 동시에 두 번 결제하면
+      잔액이 마이너스가 되거나 한 번만 차감되는 문제가 있었다.
+    - 이제는 조건부 UPDATE 로 한 번에 처리하고, 실제 차감 여부를 rowcount 로 확인한다.
+    - 0원 결제(무료 쿠폰 등)도 실패하지 않고 거래내역만 남긴다.
+    """
+    amount = int(amount)
+    if amount < 0:
         return False
-    new_balance = user['balance'] - amount
+
+    user = get_user(user_id)
+    if not user and username:
+        get_or_create_user(user_id, username)
+
     conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE users SET balance=? WHERE user_id=?', (new_balance, str(user_id)))
+    if amount == 0:
+        c.execute('INSERT INTO transactions (user_id, amount, type, description) VALUES (?, 0, ?, ?)',
+                  (str(user_id), trans_type, description))
+        conn.commit()
+        conn.close()
+        return True
+
+    c.execute('UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?',
+              (amount, str(user_id), amount))
+    if c.rowcount == 0:
+        conn.rollback()
+        conn.close()
+        return False
     c.execute('INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)',
               (str(user_id), -amount, trans_type, description))
     conn.commit()
     conn.close()
     return True
+
+def add_balance_all(amount, trans_type='admin_add', description=''):
+    """모든 등록 유저에게 동일한 포인트 지급 (각 유저별 거래 내역 기록)
+
+    SQL 증분 연산으로 처리해 동시 결제/충전과 충돌하지 않게 한다.
+
+    Returns: 지급된 유저 수
+    """
+    amount = int(amount)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM users')
+    user_ids = [str(r['user_id']) for r in c.fetchall()]
+    for uid in user_ids:
+        c.execute('UPDATE users SET balance = balance + ? WHERE user_id=?', (amount, uid))
+        c.execute('INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)',
+                  (uid, amount, trans_type, description))
+    conn.commit()
+    conn.close()
+    return len(user_ids)
+
+def deduct_balance_all(amount, trans_type='admin_remove', description=''):
+    """모든 등록 유저에게서 동일한 포인트 차감 (잔액이 0 미만으로는 내려가지 않음)
+
+    Returns: (차감된 유저 수, 실제 총 차감 포인트)
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users')
+    rows = c.fetchall()
+    affected = 0
+    total_deducted = 0
+    for row in rows:
+        deducted = min(amount, row['balance'])
+        if deducted <= 0:
+            continue
+        new_balance = row['balance'] - deducted
+        c.execute('UPDATE users SET balance=? WHERE user_id=?', (new_balance, str(row['user_id'])))
+        c.execute('INSERT INTO transactions (user_id, amount, type, description) VALUES (?, ?, ?, ?)',
+                  (str(row['user_id']), -deducted, trans_type, description))
+        affected += 1
+        total_deducted += deducted
+    conn.commit()
+    conn.close()
+    return affected, total_deducted
 
 def get_users():
     """Get all users"""
@@ -748,13 +940,17 @@ def close_ticket(tid):
     conn.close()
 
 # ============ COUPONS (할인 쿠폰) ============
-def create_coupon(code, discount_amount, max_uses=0):
-    """쿠폰 생성 - 코드 중복 시 -1 반환"""
+def create_coupon(code, discount_amount, max_uses=0, discount_type='amount'):
+    """쿠폰 생성 - 코드 중복 시 -1 반환
+
+    discount_type: 'amount' = 정액(원), 'percent' = 정률(%)
+    """
     conn = get_conn()
     c = conn.cursor()
+    dtype = 'percent' if str(discount_type).lower() == 'percent' else 'amount'
     try:
-        c.execute('INSERT INTO coupons (code, discount_amount, max_uses) VALUES (?, ?, ?)',
-                  (code.strip().upper(), int(discount_amount), int(max_uses)))
+        c.execute('INSERT INTO coupons (code, discount_amount, max_uses, discount_type) VALUES (?, ?, ?, ?)',
+                  (str(code).strip().upper(), int(discount_amount), int(max_uses), dtype))
         conn.commit()
         cid = c.lastrowid
     except sqlite3.IntegrityError:
@@ -799,13 +995,59 @@ def get_coupon_by_code(code):
         return None
     return coupon
 
-def use_coupon(cid):
-    """쿠폰 사용 처리 (사용 횟수 +1)"""
+def coupon_discount_amount(coupon, price):
+    """쿠폰으로 할인될 금액 계산 (가격보다 클 수 없음)"""
+    price = max(0, int(price))
+    if not coupon:
+        return 0
+    try:
+        value = int(coupon.get('discount_amount') or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return 0
+    if str(coupon.get('discount_type') or 'amount').lower() == 'percent':
+        value = min(value, 100)
+        return price * value // 100
+    return min(price, value)
+
+def coupon_final_price(coupon, price):
+    """쿠폰 적용 후 최종 결제 금액 (0원 가능)"""
+    return max(0, max(0, int(price)) - coupon_discount_amount(coupon, price))
+
+def use_coupon(cid, user_id=None, order_id=None, discount=0):
+    """쿠폰 사용 처리 (원자적, 사용 횟수 +1)
+
+    max_uses 제한을 SQL 조건으로 검사하므로 동시 사용에도 초과 사용되지 않는다.
+    Returns: 사용 성공 여부
+    """
     conn = get_conn()
     c = conn.cursor()
-    c.execute('UPDATE coupons SET used_count=used_count+1 WHERE id=?', (cid,))
+    c.execute('''UPDATE coupons SET used_count = used_count + 1
+                 WHERE id=? AND active=1 AND (max_uses=0 OR used_count < max_uses)''', (cid,))
+    ok = c.rowcount > 0
+    if ok:
+        try:
+            c.execute('SELECT code FROM coupons WHERE id=?', (cid,))
+            row = c.fetchone()
+            code = row['code'] if row else ''
+            c.execute('''INSERT INTO coupon_uses (coupon_id, code, user_id, order_id, discount)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (cid, code, str(user_id or ''), order_id, int(discount or 0)))
+        except Exception:
+            pass
     conn.commit()
     conn.close()
+    return ok
+
+def get_coupon_uses(limit=50):
+    """쿠폰 사용 기록 (최신순)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM coupon_uses ORDER BY id DESC LIMIT ?', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 def delete_coupon(cid):
     """쿠폰 삭제"""
@@ -822,3 +1064,234 @@ def toggle_coupon(cid):
     c.execute('UPDATE coupons SET active = CASE WHEN active=1 THEN 0 ELSE 1 END WHERE id=?', (cid,))
     conn.commit()
     conn.close()
+
+
+# ============ SALE (전체 할인 이벤트) ============
+def get_sale():
+    """현재 진행 중인 전체 할인 설정
+
+    Returns:
+        {'active': bool, 'type': 'percent'|'amount', 'value': int,
+         'label': str, 'ends_at': str}
+    """
+    active_raw = str(get_setting('sale_active', 'false') or '').strip().lower()
+    active = active_raw in ('1', 'true', 'yes', 'on', 'y')
+
+    sale_type = str(get_setting('sale_type', 'percent') or 'percent').strip().lower()
+    if sale_type not in ('percent', 'amount'):
+        sale_type = 'percent'
+
+    try:
+        value = int(float(str(get_setting('sale_value', '0') or '0').strip() or 0))
+    except (TypeError, ValueError):
+        value = 0
+    value = max(0, value)
+    if sale_type == 'percent':
+        value = min(value, 100)
+
+    label = get_setting('sale_label', '') or ''
+    ends_at = str(get_setting('sale_ends_at', '') or '').strip()
+
+    # 종료 시각이 지났으면 자동 종료
+    if active and ends_at:
+        try:
+            from datetime import datetime as _dt
+            end = None
+            for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M'):
+                try:
+                    end = _dt.strptime(ends_at, fmt)
+                    break
+                except ValueError:
+                    continue
+            if end and _dt.now() > end:
+                active = False
+        except Exception:
+            pass
+
+    return {
+        'active': bool(active and value > 0),
+        'type': sale_type,
+        'value': value,
+        'label': label,
+        'ends_at': ends_at,
+    }
+
+def set_sale(active=True, sale_type='percent', value=0, label='', ends_at=''):
+    """전체 할인 설정 저장"""
+    set_setting('sale_active', 'true' if active else 'false')
+    set_setting('sale_type', 'percent' if str(sale_type).lower() == 'percent' else 'amount')
+    set_setting('sale_value', str(int(value)))
+    set_setting('sale_label', str(label or ''))
+    set_setting('sale_ends_at', str(ends_at or ''))
+    return get_sale()
+
+def stop_sale():
+    """전체 할인 종료"""
+    set_setting('sale_active', 'false')
+    return get_sale()
+
+def apply_sale(price):
+    """전체 할인 적용 → (할인 적용 가격, 할인 금액)"""
+    price = max(0, int(price))
+    sale = get_sale()
+    if not sale['active']:
+        return price, 0
+    if sale['type'] == 'percent':
+        discount = price * sale['value'] // 100
+    else:
+        discount = min(price, sale['value'])
+    return max(0, price - discount), discount
+
+def sale_summary():
+    """할인 안내 문구 (할인 중이 아니면 빈 문자열)"""
+    sale = get_sale()
+    if not sale['active']:
+        return ''
+    unit = '%' if sale['type'] == 'percent' else '원'
+    if sale['label']:
+        text = f'🔥 {sale["label"]} ({sale["value"]}{unit} 할인)'
+    else:
+        text = f'🔥 전체 {sale["value"]}{unit} 할인 진행중'
+    if sale['ends_at']:
+        text += f' · ~{sale["ends_at"]}'
+    return text
+
+
+def sale_label_text():
+    """할인 짧은 라벨 (할인 중이 아니면 빈 문자열)"""
+    sale = get_sale()
+    if not sale['active']:
+        return ''
+    unit = '%' if sale['type'] == 'percent' else '원'
+    return str(sale['label'] or f"{sale['value']}{unit} 할인")
+
+
+# ============ STOCK LOGS (입고 기록) ============
+def log_stock(product_id, product_name, count, total_stock=0, source='dashboard', actor=''):
+    """입고 기록 저장 (대시보드/명령어 공통)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''INSERT INTO stock_logs (product_id, product_name, count, total_stock, source, actor)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (product_id, str(product_name)[:100], int(count), int(total_stock),
+               str(source)[:20], str(actor)[:100]))
+    conn.commit()
+    lid = c.lastrowid
+    conn.close()
+    return lid
+
+def restock_product(product_id, count, source='dashboard', actor=''):
+    """상품 입고: 재고 증가 + 입고 로그 기록
+
+    Returns:
+        {'product': dict, 'count': int, 'total_stock': int} 또는 None
+    """
+    count = int(count)
+    if count <= 0:
+        return None
+    product = get_product(product_id)
+    if not product:
+        return None
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('UPDATE products SET stock = stock + ? WHERE id=?', (count, product_id))
+    conn.commit()
+    conn.close()
+
+    product = get_product(product_id)
+    log_stock(product_id, product['name'], count, product['stock'], source=source, actor=actor)
+    return {'product': product, 'count': count, 'total_stock': product['stock']}
+
+def get_stock_logs(limit=50):
+    """입고 기록 조회 (최신순)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM stock_logs ORDER BY id DESC LIMIT ?', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_low_stock_products(threshold=3, active_only=True):
+    """재고가 threshold 이하인 상품 목록 (재고 부족 알림용)"""
+    conn = get_conn()
+    c = conn.cursor()
+    if active_only:
+        c.execute('SELECT * FROM products WHERE active=1 AND stock <= ? ORDER BY stock ASC', (int(threshold),))
+    else:
+        c.execute('SELECT * FROM products WHERE stock <= ? ORDER BY stock ASC', (int(threshold),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ============ AUDIT LOGS (관리자 행동 기록) ============
+def add_audit_log(action, actor_id='', actor_name='', detail=''):
+    """관리자 행동(입고/할인/포인트 지급 등) 기록"""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('''INSERT INTO audit_logs (action, actor_id, actor_name, detail)
+                     VALUES (?, ?, ?, ?)''',
+                  (str(action)[:60], str(actor_id)[:40], str(actor_name)[:100], str(detail)[:1000]))
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+
+def get_audit_logs(limit=50):
+    """감사 로그 조회 (최신순)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ============ DM NOTICE TARGETS (전체 공지) ============
+def get_notice_targets():
+    """DM 공지 발송 대상 (등록된 유저 ID 목록)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT user_id, username FROM users ORDER BY rowid')
+    rows = c.fetchall()
+    conn.close()
+    return [{'user_id': str(r['user_id']), 'username': r['username']} for r in rows]
+
+def count_users():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) AS cnt FROM users')
+    row = c.fetchone()
+    conn.close()
+    return row['cnt'] if row else 0
+
+
+# ============ MAINTENANCE (오래된 데이터 정리) ============
+def purge_old_data(days=90):
+    """오래된 로그/완료된 충전 요청 정리 (DB가 계속 커지는 것 방지)
+
+    Returns: 삭제된 행 수
+    """
+    days = max(1, int(days))
+    removed = 0
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM stock_logs WHERE created_at < datetime('now', ?)", (f'-{days} days',))
+        removed += c.rowcount or 0
+        c.execute("DELETE FROM audit_logs WHERE created_at < datetime('now', ?)", (f'-{days} days',))
+        removed += c.rowcount or 0
+        c.execute("DELETE FROM coupon_uses WHERE created_at < datetime('now', ?)", (f'-{days} days',))
+        removed += c.rowcount or 0
+        c.execute("DELETE FROM charge_requests WHERE status!='pending' AND created_at < datetime('now', ?)",
+                  (f'-{days} days',))
+        removed += c.rowcount or 0
+        c.execute("DELETE FROM transactions WHERE created_at < datetime('now', ?)", (f'-{days * 3} days',))
+        removed += c.rowcount or 0
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    conn.close()
+    return removed
+

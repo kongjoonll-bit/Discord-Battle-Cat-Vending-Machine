@@ -14,6 +14,7 @@ import threading
 import time
 import asyncio
 import re
+import secrets
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -44,9 +45,194 @@ if _saved_title and '냥코대전생' in _saved_title:
     db.set_setting('vending_title', _saved_title.replace('냥코대전생', '냥코대전쟁'))
     logger.info(f"자판기 제목 오타 자동 교정: {_saved_title} -> {db.get_setting('vending_title', '')}")
 
+# 대시보드 URL 자동 정규화: '/dashboard' 경로로 저장된 값을 루트 URL로 교정 (ping/웹훅 404 방지)
+_saved_dash_url = (db.get_setting('dashboard_url', '') or '').strip().rstrip('/')
+if _saved_dash_url.endswith('/dashboard'):
+    db.set_setting('dashboard_url', _saved_dash_url[:-len('/dashboard')])
+    logger.info(f"대시보드 URL 자동 정규화: /dashboard 제거 -> {db.get_setting('dashboard_url', '')}")
+
 # Create Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'nyanko-vending-secret-key-change-me')
+# 세션 쿠키 보안 강화 (HTTPS 환경에서 CSRF/세션 탈취 방지)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    REMEMBER_COOKIE_HTTPONLY=True,
+)
+
+# ============ 보안: 비밀번호 해시 / CSRF / 로그인 시도 제한 ============
+import hashlib as _hashlib
+import hmac as _hmac
+
+_PASSWORD_ITERATIONS = 120000
+# 대시보드로 절대 노출되면 안 되는 설정 키 (마스킹 대상)
+_SENSITIVE_SETTINGS = {
+    'discord_token', 'admin_password', 'admin_password_hash',
+    'admin_session_token', 'webhook_key',
+}
+
+
+def hash_password(password):
+    """PBKDF2-SHA256 해시 (salt 포함) 생성"""
+    salt = secrets.token_hex(16)
+    digest = _hashlib.pbkdf2_hmac(
+        'sha256', str(password).encode('utf-8'), salt.encode('utf-8'), _PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${_PASSWORD_ITERATIONS}${salt}${digest.hex()}"
+
+
+def verify_password(password, stored):
+    """해시 검증 (형식이 다르면 False)"""
+    try:
+        algo, iterations, salt, digest = str(stored).split('$', 3)
+        if algo != 'pbkdf2_sha256':
+            return False
+        calc = _hashlib.pbkdf2_hmac(
+            'sha256', str(password).encode('utf-8'), salt.encode('utf-8'), int(iterations))
+        return _hmac.compare_digest(calc.hex(), digest)
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def set_admin_password(password):
+    """관리자 비밀번호를 해시로 저장하고 평문은 제거"""
+    db.set_setting('admin_password_hash', hash_password(password))
+    db.set_setting('admin_password', '')
+    logger.info("[SECURITY] 관리자 비밀번호가 해시로 저장되었습니다.")
+
+
+def check_admin_password(password):
+    """비밀번호 확인 - 저장된 해시 우선, 없으면 예전 평문 설정과 비교 후 자동 해시 전환"""
+    stored_hash = db.get_setting('admin_password_hash', '')
+    if stored_hash:
+        return verify_password(password, stored_hash)
+    plain = str(db.get_setting('admin_password', 'zizer731!!') or '')
+    if plain and _hmac.compare_digest(str(password), plain):
+        set_admin_password(password)
+        return True
+    return False
+
+
+def mask_secret(value):
+    """민감 설정값 마스킹 (앞 4자 + 뒤 4자만 노출)"""
+    value = str(value or '')
+    if not value:
+        return ''
+    if len(value) <= 8:
+        return '••••••••'
+    return f"{value[:4]}••••••••{value[-4:]}"
+
+
+def _settings_for_client():
+    """대시보드에 내려줄 설정 (민감값은 마스킹)"""
+    settings = db.get_all_settings()
+    for key in _SENSITIVE_SETTINGS:
+        if settings.get(key):
+            settings[key] = mask_secret(settings[key])
+    return settings
+
+
+def csrf_token():
+    """세션 CSRF 토큰 (없으면 생성)"""
+    token = session.get('csrf_token')
+    if not token:
+        token = secrets.token_hex(32)
+        session['csrf_token'] = token
+    return token
+
+
+# 웹훅/핑은 외부(Tasker/Render)에서 호출하므로 CSRF 예외 (자체 키/서명으로 보호)
+_CSRF_EXEMPT_ENDPOINTS = {
+    'api_deposit_webhook', 'api_test_deposit_webhook', 'ping',
+}
+
+
+@app.before_request
+def _csrf_protect():
+    """상태 변경 요청(POST/PUT/PATCH/DELETE)에 CSRF 토큰 검증"""
+    if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        return None
+    if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
+        return None
+    if not session.get('admin_logged_in'):
+        return None  # 로그인 라우트는 자체적으로 토큰 검증
+    expected = session.get('csrf_token')
+    payload = request.get_json(silent=True) or {}
+    provided = (request.headers.get('X-CSRF-Token')
+                or request.form.get('csrf_token')
+                or payload.get('csrf_token'))
+    if not expected or not provided or not _hmac.compare_digest(str(expected), str(provided)):
+        logger.warning(f"[SECURITY] CSRF 검증 실패: {request.path} ({request.remote_addr})")
+        return jsonify({'success': False, 'error': 'CSRF 토큰이 유효하지 않습니다. 페이지를 새로고침 후 다시 시도해주세요.'}), 403
+    return None
+
+
+@app.context_processor
+def _inject_csrf():
+    return {'csrf_token': csrf_token()}
+
+
+# 로그인 무차별 대입 방지 (IP당 5회 / 5분)
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_SECONDS = 300
+_login_attempts = {}
+_login_lock = threading.Lock()
+
+
+def _login_blocked(ip):
+    now = time.time()
+    with _login_lock:
+        attempts = [t for t in _login_attempts.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
+        _login_attempts[ip] = attempts
+        if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+            return True, int(_LOGIN_WINDOW_SECONDS - (now - attempts[0]))
+        return False, 0
+
+
+def _record_login_failure(ip):
+    with _login_lock:
+        _login_attempts.setdefault(ip, []).append(time.time())
+
+
+def _clear_login_failures(ip):
+    with _login_lock:
+        _login_attempts.pop(ip, None)
+
+
+def _log_coro_result(future):
+    """백그라운드 코루틴 예외를 로그로 남김 (조용한 실패 방지)"""
+    try:
+        future.result()
+    except Exception as e:
+        logger.error(f"[BOT] 백그라운드 작업 오류: {e}")
+
+
+def _run_bot_coro(coro_factory, on_done=None):
+    """봇 이벤트 루프에서 코루틴 실행 (Flask 스레드 → 봇 루프, 스레드 안전)
+
+    Returns: concurrent.futures.Future 또는 None(봇 오프라인)
+    """
+    loop = getattr(bot, 'loop', None)
+    if not bot.is_ready() or loop is None or loop.is_closed():
+        logger.warning("[BOT] 봇이 오프라인이라 요청을 실행할 수 없습니다.")
+        return None
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+    except Exception as e:
+        logger.error(f"[BOT] 코루틴 예약 실패: {e}")
+        return None
+    future.add_done_callback(on_done or _log_coro_result)
+    return future
+
+
+def _schedule_vending_refresh(force=False):
+    """가격/할인/재고 변경 시 자판기 메시지 갱신"""
+    return _run_bot_coro(lambda: bot.refresh_vending_machines(force_edit=force))
+
+
+def _admin_actor():
+    """감사 로그용 관리자 식별자"""
+    return f"dashboard:{request.remote_addr or 'unknown'}"
 
 # ============ PERMANENT SESSION (로그인 유지) ============
 from datetime import timedelta
@@ -71,11 +257,17 @@ toss_monitor = TossDepositMonitor()
 
 # ============ PING KEEPER (5분마다) ============
 def _get_ping_url():
-    """핑 대상 URL 조회: 설정의 dashboard_url 우선, 없으면 Render 외부 URL(RENDER_EXTERNAL_URL) 자동 사용"""
+    """핑 대상 URL 조회: 설정의 dashboard_url 우선, 없으면 Render 외부 URL(RENDER_EXTERNAL_URL) 자동 사용
+
+    설정값에 /dashboard 경로가 포함돼 있어도 /ping 404가 나지 않도록 루트 경로로 정규화한다.
+    """
     url = db.get_setting('dashboard_url', '')
     if not url:
         url = os.environ.get('RENDER_EXTERNAL_URL', '')
-    return url.strip() if url else ''
+    url = (url or '').strip().rstrip('/')
+    if url.endswith('/dashboard'):
+        url = url[:-len('/dashboard')]
+    return url
 
 def ping_keeper():
     """5분마다 서비스에 핑 전송 (Render 무료 플랜 슬립 방지)"""
@@ -83,7 +275,7 @@ def ping_keeper():
         try:
             url = _get_ping_url()
             if url:
-                resp = requests.get(url.rstrip('/') + '/ping', timeout=10)
+                resp = requests.get(url + '/ping', timeout=10)
                 logger.info(f"[PING] {url}/ping -> {resp.status_code} (5분 후 재전송)")
             else:
                 logger.warning("[PING] 핑 URL 미설정! 대시보드 설정에서 '대시보드 URL'을 저장하거나 RENDER_EXTERNAL_URL 환경변수가 필요합니다.")
@@ -255,18 +447,7 @@ def handle_deposit(amount, text, depositor=None):
         embed.set_footer(text="냥코 KEY 자판기 🐱")
         send_dm_safe(charge['user_id'], embed=embed)
         
-        # Send deposit log to deposit log channel
-        embed_log = discord.Embed(
-            title="💰 입금 확인!",
-            description=f"**{charge['username']}** 님의 입금이 확인되었습니다!",
-            color=discord.Color.green(),
-            timestamp=datetime.now()
-        )
-        embed_log.add_field(name="입금자명", value=charge['depositor_name'], inline=True)
-        embed_log.add_field(name="입금 금액", value=f"{amount:,}원", inline=True)
-        embed_log.add_field(name="충전 포인트", value=f"{amount:,}포인트", inline=True)
-        embed_log.add_field(name="현재 잔액", value=f"{new_balance:,}포인트", inline=True)
-        send_to_discord_channel('deposit_log_channel_id', embed=embed_log)
+        # (입금 로그는 _record_webhook_log가 디코 deposit_log_channel_id로 자동 미러링)
         
         # Notify admin channel (always for tracking)
         send_to_discord_channel('admin_channel_id',
@@ -278,16 +459,7 @@ def handle_deposit(amount, text, depositor=None):
     logger.info(f"No matching charge request for {amount:,}원 (depositor: {depositor})")
     _record_webhook_log('warn', f"미할당 입금: {amount:,}원 (입금자: {depositor or '파싱실패'}) - 금액/입금자명 일치 대기요청 없음")
     
-    # Send deposit log to deposit log channel (unmatched)
-    embed_log = discord.Embed(
-        title="💰 입금 감지 (미할당)",
-        description=f"금액: {amount:,}원\n내용: {text[:150]}",
-        color=discord.Color.orange(),
-        timestamp=datetime.now()
-    )
-    if depositor:
-        embed_log.add_field(name="예상 입금자", value=depositor, inline=True)
-    send_to_discord_channel('deposit_log_channel_id', embed=embed_log)
+    # (입금 로그는 _record_webhook_log가 디코 deposit_log_channel_id로 자동 미러링)
     
     # Notify admin channel about unallocated deposit
     send_to_discord_channel('admin_channel_id',
@@ -318,19 +490,43 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
+        ip = request.remote_addr or 'unknown'
+        blocked, retry_after = _login_blocked(ip)
+        if blocked:
+            logger.warning(f"[SECURITY] 로그인 시도 초과 차단: {ip}")
+            return render_template('login.html',
+                                   error=f'로그인 시도가 너무 많습니다. {retry_after}초 후 다시 시도해주세요.'), 429
+
+        # 로그인 폼 CSRF 검증
+        form_token = request.form.get('csrf_token', '')
+        session_token = session.get('csrf_token', '')
+        if not form_token or not session_token or not _hmac.compare_digest(form_token, session_token):
+            logger.warning(f"[SECURITY] 로그인 CSRF 검증 실패: {ip}")
+            return render_template('login.html',
+                                   error='세션이 만료되었습니다. 페이지를 새로고침 후 다시 시도해주세요.'), 400
+
         password = request.form.get('password', '')
-        admin_password = db.get_setting('admin_password', 'zizer731!!')
-        if password == admin_password:
-            # 영구 세션으로 설정 - 로그아웃하지 않는 이상 로그인 유지
+        if check_admin_password(password):
+            _clear_login_failures(ip)
+            # 세션 고정 공격 방지: 로그인 성공 시 세션 재발급
+            session.clear()
             session.permanent = True
             session['admin_logged_in'] = True
+            session['csrf_token'] = secrets.token_hex(32)
+            session['login_ip'] = ip
+            db.add_audit_log('admin_login', '', f'ip:{ip}', '대시보드 로그인 성공')
             return redirect(url_for('dashboard'))
-        return render_template('login.html', error='비밀번호가 올바르지 않습니다.')
+
+        _record_login_failure(ip)
+        remaining = max(0, _LOGIN_MAX_ATTEMPTS - len(_login_attempts.get(ip, [])))
+        logger.warning(f"[SECURITY] 로그인 실패: {ip} (남은 시도 {remaining}회)")
+        return render_template('login.html',
+                               error=f'비밀번호가 올바르지 않습니다. (남은 시도 {remaining}회)')
     return render_template('login.html')
 
 @app.route('/logout')
 def logout():
-    session.pop('admin_logged_in', None)
+    session.clear()
     return redirect(url_for('login'))
 
 @app.route('/ping')
@@ -354,13 +550,18 @@ def dashboard():
     charge_expire_minutes = _get_charge_expire_minutes()
 
     # 웹훅 전체 URL 만들기: 대시보드 URL → Render 외부 URL → 로컬 순
-    _base = (settings.get('dashboard_url', '')
-             or os.environ.get('RENDER_EXTERNAL_URL', '')
-             or f"http://localhost:{os.environ.get('PORT', '5001')}").rstrip('/')
+    # (dashboard_url에 /dashboard 경로가 포함돼 있으면 정규화 - _get_ping_url 이 루트로 변환)
+    _base = _get_ping_url() or f"http://localhost:{os.environ.get('PORT', '5001')}"
     webhook_full_url = f"{_base}/api/deposit-webhook?key={webhook_key}"
 
     # Bot status
     bot_status = 'online' if bot.is_ready() else 'offline'
+
+    # 할인 이벤트 / 입고 기록 / 감사 로그 (대시보드 초기 렌더링용)
+    sale = db.get_sale()
+    sale_summary = db.sale_summary()
+    stock_logs = db.get_stock_logs(20)
+    audit_logs = db.get_audit_logs(20)
 
     return render_template('dashboard.html',
         stats=stats,
@@ -372,7 +573,11 @@ def dashboard():
         bot_name=settings.get('bot_name', '냥코 KEY 자판기'),
         webhook_full_url=webhook_full_url,
         pending_charges=pending_charges,
-        charge_expire_minutes=charge_expire_minutes
+        charge_expire_minutes=charge_expire_minutes,
+        sale=sale,
+        sale_summary=sale_summary,
+        stock_logs=stock_logs,
+        audit_logs=audit_logs
     )
 
 # ============ API ROUTES ============
@@ -450,6 +655,9 @@ def api_add_product():
     if not name or price <= 0:
         return jsonify({'error': '상품명과 가격을 확인해주세요.'}), 400
     pid = db.add_product(name, price, description, category=category)
+    db.add_audit_log('product_add', '', _admin_actor(),
+                     f"{name} / {int(price):,}원 / 카테고리: {category or '없음'}")
+    _schedule_vending_refresh(force=True)
     return jsonify({'success': True, 'id': pid})
 
 @app.route('/api/products/<int:pid>', methods=['PUT'])
@@ -464,36 +672,47 @@ def api_update_product(pid):
         active=data.get('active'),
         category=data.get('category', '')
     )
+    db.add_audit_log('product_update', '', _admin_actor(),
+                     f"ID {pid} / {data.get('name', '')} / {data.get('price', '')}원")
+    _schedule_vending_refresh(force=True)
     return jsonify({'success': True})
 
 @app.route('/api/products/<int:pid>', methods=['DELETE'])
 @login_required
 def api_delete_product(pid):
+    product = db.get_product(pid)
     db.delete_product(pid)
+    db.add_audit_log('product_delete', '', _admin_actor(),
+                     f"ID {pid} / {(product or {}).get('name', '알 수 없음')}")
+    _schedule_vending_refresh(force=True)
     return jsonify({'success': True})
 
 # --- Keys ---
 @app.route('/api/products/<int:pid>/keys', methods=['POST'])
 @login_required
 def api_add_keys(pid):
-    data = request.json
+    data = request.json or {}
     keys_text = data.get('keys', '')
     key_list = [k.strip() for k in keys_text.split('\n') if k.strip()]
     if not key_list:
         return jsonify({'error': '키를 입력해주세요.'}), 400
     db.add_keys(pid, key_list)
-    
-    # 입고 채널에 공지 전송 + 자판기 새로고침 (봇이 실행 중일 때만)
+
     product = db.get_product(pid)
-    if product and bot.is_ready():
-        try:
-            # 봇의 이벤트 루프에서 안전하게 실행 (스레드 간 호출)
-            asyncio.run_coroutine_threadsafe(bot.send_stock_notice(product, len(key_list)), bot.loop)
-            asyncio.run_coroutine_threadsafe(bot.refresh_vending_machines(), bot.loop)
-        except Exception as e:
-            logger.error(f"Stock notice error: {e}")
-    
-    return jsonify({'success': True, 'count': len(key_list)})
+    total_stock = db.count_available_keys(pid)
+    if product:
+        # 입고 기록 + 감사 로그 (대시보드/명령어 공통 추적)
+        db.log_stock(pid, product['name'], len(key_list), total_stock,
+                     source='dashboard', actor=_admin_actor())
+        db.add_audit_log('stock_add', '', _admin_actor(),
+                         f"{product['name']} +{len(key_list)}개 (총 {total_stock}개)")
+
+        # 입고 채널 공지 + 자판기 새로고침 (봇이 실행 중일 때만)
+        if bot.is_ready():
+            _run_bot_coro(lambda: bot.send_stock_notice(product, len(key_list), total_stock))
+            _schedule_vending_refresh(force=True)
+
+    return jsonify({'success': True, 'count': len(key_list), 'total_stock': total_stock})
 
 @app.route('/api/keys', methods=['GET'])
 @login_required
@@ -559,15 +778,41 @@ def api_cancel_order(oid):
 @app.route('/api/settings', methods=['GET'])
 @login_required
 def api_get_settings():
-    return jsonify(db.get_all_settings())
+    # 민감값(봇 토큰/비밀번호)은 마스킹해서 반환
+    return jsonify(_settings_for_client())
 
 @app.route('/api/settings', methods=['POST'])
 @login_required
 def api_update_settings():
-    data = request.json
+    data = request.json or {}
+    updated = []
+    password_changed = False
     for key, value in data.items():
+        if key == 'admin_password':
+            value = str(value or '').strip()
+            # 빈 값/마스킹된 값은 "변경 안 함"으로 처리
+            if not value or '•' in value:
+                continue
+            set_admin_password(value)
+            password_changed = True
+            updated.append(key)
+            continue
+        if key in _SENSITIVE_SETTINGS:
+            # 빈 값/마스킹된 값은 "변경 안 함" (실수로 토큰이 지워지는 것 방지)
+            if not str(value or '').strip() or '•' in str(value):
+                continue
         db.set_setting(key, value)
-    return jsonify({'success': True})
+        updated.append(key)
+
+    if updated:
+        detail = ', '.join(updated)[:500]
+        if password_changed:
+            detail += ' (비밀번호 변경)'
+        db.add_audit_log('settings_update', '', _admin_actor(), detail)
+        logger.info(f"[DASHBOARD] 설정 변경: {detail}")
+        # 할인/문구/카테고리 설정이 자판기에 즉시 반영되도록 갱신
+        _schedule_vending_refresh(force=True)
+    return jsonify({'success': True, 'updated': updated})
 
 # --- Admins ---
 @app.route('/api/admins', methods=['GET'])
@@ -604,25 +849,35 @@ def api_get_users():
 @app.route('/api/users/<user_id>/points', methods=['POST'])
 @login_required
 def api_give_points(user_id):
-    data = request.json
-    amount = data.get('amount', 0)
+    data = request.json or {}
+    try:
+        amount = int(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': '금액을 확인해주세요.'}), 400
     username = data.get('username', '')
     if amount <= 0:
         return jsonify({'error': '금액을 확인해주세요.'}), 400
     new_balance = db.add_balance(user_id, username, amount, 'admin_add', '대시보드에서 포인트 지급')
+    db.add_audit_log('grant_points', user_id, _admin_actor(),
+                     f"+{int(amount):,}P → {username or user_id} (잔액 {new_balance:,}P)")
     return jsonify({'success': True, 'balance': new_balance})
 
 @app.route('/api/users/<user_id>/points/deduct', methods=['POST'])
 @login_required
 def api_deduct_points(user_id):
-    data = request.json
-    amount = data.get('amount', 0)
+    data = request.json or {}
+    try:
+        amount = int(data.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': '금액을 확인해주세요.'}), 400
     if amount <= 0:
         return jsonify({'error': '금액을 확인해주세요.'}), 400
     success = db.deduct_balance(user_id, amount, 'admin_remove', '대시보드에서 포인트 차감')
     if not success:
         return jsonify({'error': '잔액 부족'}), 400
     new_balance = db.get_balance(user_id)
+    db.add_audit_log('deduct_points', user_id, _admin_actor(),
+                     f"-{int(amount):,}P → {user_id} (잔액 {new_balance:,}P)")
     return jsonify({'success': True, 'balance': new_balance})
 
 # --- Coupons (쿠폰/할인 이벤트) ---
@@ -634,10 +889,13 @@ def api_get_coupons():
 @app.route('/api/coupons', methods=['POST'])
 @login_required
 def api_create_coupon():
-    data = request.json
+    data = request.json or {}
     code = data.get('code', '').strip()
     discount_amount = data.get('discount_amount', 0)
     max_uses = data.get('max_uses', 0)
+    discount_type = str(data.get('discount_type', 'amount') or 'amount').lower()
+    if discount_type not in ('amount', 'percent'):
+        discount_type = 'amount'
     if not code:
         return jsonify({'error': '쿠폰 코드를 입력해주세요.'}), 400
     try:
@@ -647,17 +905,25 @@ def api_create_coupon():
         return jsonify({'error': '할인 금액과 사용 횟수는 숫자로 입력해주세요.'}), 400
     if discount_amount <= 0:
         return jsonify({'error': '할인 금액은 0보다 커야 합니다.'}), 400
+    if discount_type == 'percent' and discount_amount > 100:
+        return jsonify({'error': '할인율은 100% 이하여야 합니다.'}), 400
     if max_uses < 0:
         return jsonify({'error': '최대 사용 횟수는 0 이상이어야 합니다.'}), 400
-    cid = db.create_coupon(code, discount_amount, max_uses)
+    cid = db.create_coupon(code, discount_amount, max_uses, discount_type=discount_type)
     if cid == -1:
         return jsonify({'error': '이미 존재하는 쿠폰 코드입니다.'}), 400
+    unit = '%' if discount_type == 'percent' else '원'
+    db.add_audit_log('coupon_create', '', _admin_actor(),
+                     f"{code.upper()} ({discount_amount}{unit} 할인, 최대 {max_uses or '무제한'}회)")
     return jsonify({'success': True, 'id': cid})
 
 @app.route('/api/coupons/<int:cid>', methods=['DELETE'])
 @login_required
 def api_delete_coupon(cid):
+    coupon = db.get_coupon(cid)
     db.delete_coupon(cid)
+    db.add_audit_log('coupon_delete', '', _admin_actor(),
+                     (coupon or {}).get('code', f'ID {cid}'))
     return jsonify({'success': True})
 
 @app.route('/api/coupons/<int:cid>/toggle', methods=['POST'])
@@ -665,7 +931,122 @@ def api_delete_coupon(cid):
 def api_toggle_coupon(cid):
     db.toggle_coupon(cid)
     coupon = db.get_coupon(cid)
-    return jsonify({'success': True, 'active': coupon['active'] if coupon else 0})
+    active = coupon['active'] if coupon else 0
+    if coupon:
+        db.add_audit_log('coupon_toggle', '', _admin_actor(),
+                         f"{coupon['code']} → {'활성화' if active else '비활성화'}")
+    return jsonify({'success': True, 'active': active})
+
+# --- 전체 할인 (Sale / 할인 이벤트) ---
+@app.route('/api/sale', methods=['GET'])
+@login_required
+def api_get_sale():
+    sale = db.get_sale()
+    sale['summary'] = db.sale_summary()
+    return jsonify(sale)
+
+@app.route('/api/sale', methods=['POST'])
+@login_required
+def api_update_sale():
+    """전체 할인 시작/종료 (모든 상품에 적용, 쿠폰과 중복 적용 가능)"""
+    data = request.json or {}
+    if data.get('stop') or data.get('active') is False:
+        sale = db.stop_sale()
+        db.add_audit_log('sale_stop', '', _admin_actor(), '전체 할인 종료')
+        logger.info("[DASHBOARD] 전체 할인 종료")
+        _schedule_vending_refresh(force=True)
+        return jsonify({'success': True, 'sale': sale, 'summary': db.sale_summary()})
+
+    sale_type = str(data.get('type', 'percent') or 'percent').lower()
+    if sale_type not in ('percent', 'amount'):
+        return jsonify({'error': '할인 유형이 올바르지 않습니다.'}), 400
+    try:
+        value = int(data.get('value', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': '할인 값은 숫자로 입력해주세요.'}), 400
+    if sale_type == 'percent':
+        if not 1 <= value <= 100:
+            return jsonify({'error': '할인율은 1~100% 사이여야 합니다.'}), 400
+    elif value <= 0:
+        return jsonify({'error': '할인 금액은 0보다 커야 합니다.'}), 400
+
+    label = str(data.get('label', '') or '').strip()[:60]
+    ends_at = str(data.get('ends_at', '') or '').strip()
+    if ends_at:
+        valid = False
+        for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M'):
+            try:
+                datetime.strptime(ends_at, fmt)
+                valid = True
+                break
+            except ValueError:
+                continue
+        if not valid:
+            return jsonify({'error': '종료 시각 형식이 올바르지 않습니다. (예: 2026-01-31 23:59)'}), 400
+
+    sale = db.set_sale(True, sale_type, value, label, ends_at)
+    unit = '%' if sale_type == 'percent' else '원'
+    db.add_audit_log('sale_start', '', _admin_actor(),
+                     f"{value}{unit} 할인 시작 {label} {ends_at}".strip())
+    logger.info(f"[DASHBOARD] 전체 할인 시작: {value}{unit} {label} {ends_at}")
+    _schedule_vending_refresh(force=True)
+    return jsonify({'success': True, 'sale': sale, 'summary': db.sale_summary()})
+
+# --- 입고 기록 (Stock logs) ---
+@app.route('/api/stock-logs', methods=['GET'])
+@login_required
+def api_get_stock_logs():
+    limit = request.args.get('limit', 50, type=int) or 50
+    return jsonify(db.get_stock_logs(min(max(limit, 1), 500)))
+
+# --- 감사 로그 (Audit logs) ---
+@app.route('/api/audit-logs', methods=['GET'])
+@login_required
+def api_get_audit_logs():
+    limit = request.args.get('limit', 100, type=int) or 100
+    return jsonify(db.get_audit_logs(min(max(limit, 1), 500)))
+
+# --- DM 전체 공지 (유저 전원에게 DM) ---
+@app.route('/api/notice/dm', methods=['POST'])
+@login_required
+def api_send_dm_notice():
+    data = request.json or {}
+    title = str(data.get('title', '') or '').strip()
+    content = str(data.get('content', '') or '').strip()
+    color = str(data.get('color', '') or '#3498db').strip()
+    if not content:
+        return jsonify({'success': False, 'message': '공지 내용을 입력해주세요.'}), 400
+    if not bot.is_ready():
+        return jsonify({'success': False, 'message': '봇이 오프라인입니다. 잠시 후 다시 시도해주세요.'}), 503
+    targets = db.get_notice_targets()
+    if not targets:
+        return jsonify({'success': False, 'message': 'DM 공지를 받을 유저가 없습니다.'}), 400
+
+    actor = _admin_actor()
+    total_targets = len(targets)
+
+    def _worker():
+        """DM 발송은 오래 걸리므로 별도 스레드에서 실행 (요청 타임아웃 방지)"""
+        try:
+            future = _run_bot_coro(
+                lambda: bot.send_dm_broadcast(title or '📢 공지', content, color))
+            if future is None:
+                logger.error("[NOTICE] 봇 오프라인으로 DM 공지를 시작하지 못했습니다.")
+                return
+            sent, failed, total = future.result(timeout=3600)
+            logger.info(f"[NOTICE] DM 공지 완료: 성공 {sent} / 실패 {failed} / 대상 {total}")
+            db.add_audit_log('notice_dm', '', actor,
+                             f"성공 {sent} / 실패 {failed} / 대상 {total} - {title or '(제목 없음)'}")
+        except Exception as e:
+            logger.error(f"[NOTICE] DM 공지 실패: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    logger.info(f"[DASHBOARD] DM 공지 시작: {total_targets}명 / {title or '(제목 없음)'}")
+    return jsonify({
+        'success': True,
+        'message': f'{total_targets}명에게 DM 공지 발송을 시작했습니다. (완료까지 시간이 걸릴 수 있습니다)',
+        'total': total_targets,
+    })
 
 # ============ 입금 웹훅 (Pushbullet 없이 폰 앱이 은행 알림을 직접 전송) ============
 
@@ -674,8 +1055,21 @@ import collections
 _webhook_log_lock = threading.Lock()
 _webhook_log = collections.deque(maxlen=50)
 
+# 디코 입금 로그 채널로 미러링할 레벨 (매 알림마다 오는 'recv'와 잡담성 'info'는 제외)
+_DISCORD_MIRROR_LEVELS = {'deposit', 'match', 'warn', 'error'}
+_DISCORD_MIRROR_META = {
+    'deposit': ('📥 입금 감지', discord.Color.blue()),
+    'match': ('✅ 자동 충전 성공', discord.Color.green()),
+    'warn': ('⚠️ 입금 처리 주의', discord.Color.orange()),
+    'error': ('❌ 입금 처리 오류', discord.Color.red()),
+}
+
 def _record_webhook_log(level, message):
-    """웹훅 수신/파싱/매칭 결과를 링버퍼에 기록 (대시보드 진단용)"""
+    """웹훅 수신/파싱/매칭 결과를 링버퍼에 기록 (대시보드 진단용)
+
+    중요 레벨(deposit/match/warn/error)은 설정된 디코 입금 로그 채널
+    ('deposit_log_channel_id')로도 자동 미러링된다.
+    """
     try:
         with _webhook_log_lock:
             _webhook_log.appendleft({
@@ -683,6 +1077,21 @@ def _record_webhook_log(level, message):
                 'level': str(level),
                 'message': str(message)[:300],
             })
+    except Exception:
+        pass
+
+    # 디코 입금 로그 채널 미러링 (채널 미설정/봇 미준비 시에는 조용히 스킵)
+    try:
+        if level in _DISCORD_MIRROR_LEVELS and bot.is_ready():
+            title, color = _DISCORD_MIRROR_META.get(level, ('📥 입금 로그', discord.Color.blue()))
+            embed = discord.Embed(
+                title=title,
+                description=str(message)[:1000],
+                color=color,
+                timestamp=datetime.now()
+            )
+            embed.set_footer(text="냥코 KEY 자판기 🐱 | 입금 로그")
+            send_to_discord_channel('deposit_log_channel_id', embed=embed)
     except Exception:
         pass
 

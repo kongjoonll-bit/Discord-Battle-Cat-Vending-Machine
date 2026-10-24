@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <title>{{ bot_name }} - 관리자 대시보드</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700;900&display=swap" rel="stylesheet">
@@ -464,7 +465,10 @@
             <a href="#" data-tab="keys"><i class="fas fa-key"></i><span>키 관리</span></a>
             <a href="#" data-tab="users"><i class="fas fa-users"></i><span>유저 관리</span></a>
             <a href="#" data-tab="coupons"><i class="fas fa-ticket"></i><span>쿠폰 관리</span></a>
+            <a href="#" data-tab="sale"><i class="fas fa-tags"></i><span>할인 이벤트</span></a>
             <a href="#" data-tab="notice"><i class="fas fa-bullhorn"></i><span>공지 보내기</span></a>
+            <a href="#" data-tab="stocklog"><i class="fas fa-boxes-stacked"></i><span>입고 기록</span></a>
+            <a href="#" data-tab="auditlog"><i class="fas fa-clipboard-list"></i><span>감사 로그</span></a>
             <a href="#" data-tab="depositlog"><i class="fas fa-history"></i><span>입금 로그</span></a>
             <a href="#" data-tab="settings"><i class="fas fa-cog"></i><span>설정</span></a>
             <a href="#" data-tab="admins"><i class="fas fa-user-shield"></i><span>관리자</span></a>
@@ -716,8 +720,15 @@
                     <input type="text" id="coupon-code" placeholder="예: WELCOME1000">
                 </div>
                 <div class="form-group">
-                    <label>할인 금액 (포인트)</label>
-                    <input type="number" id="coupon-discount" placeholder="예: 1000">
+                    <label>할인 유형</label>
+                    <select id="coupon-discount-type">
+                        <option value="amount">정액 할인 (원)</option>
+                        <option value="percent">정률 할인 (%)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>할인 금액 / 할인율 (포인트 또는 %)</label>
+                    <input type="number" id="coupon-discount" placeholder="예: 1000 (또는 10)">
                 </div>
                 <div class="form-group">
                     <label>최대 사용 횟수 (0 = 무제한)</label>
@@ -765,8 +776,138 @@
                 </button>
                 <div id="notice-result" style="margin-top: 15px;"></div>
             </div>
+            <div class="card">
+                <h3><i class="fas fa-envelope-open-text"></i> 전체 DM 공지</h3>
+                <p style="color: #888; margin-bottom: 15px;">자판기를 이용한 모든 유저에게 DM으로 공지를 보냅니다. (대상이 많으면 전송에 시간이 걸립니다)</p>
+                <div class="form-group">
+                    <label>DM 제목</label>
+                    <input type="text" id="dm-title" placeholder="예: 🎉 할인 이벤트 안내">
+                </div>
+                <div class="form-group">
+                    <label>DM 내용</label>
+                    <textarea id="dm-content" rows="4" placeholder="DM으로 보낼 내용"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>임베드 색상 (선택)</label>
+                    <input type="text" id="dm-color" placeholder="#3498db" value="#3498db">
+                </div>
+                <button class="btn btn-primary" onclick="sendDmNotice()">
+                    <i class="fas fa-envelope"></i> DM 공지 발송
+                </button>
+                <div id="dm-result" style="margin-top: 15px;"></div>
+            </div>
         </div>
         
+        <!-- Sale Tab (전체 할인 이벤트) -->
+        <div class="tab-content" id="tab-sale">
+            <div class="card">
+                <h3><i class="fas fa-tags"></i> 전체 할인 이벤트</h3>
+                <p style="color: #888; margin-bottom: 15px;">모든 상품에 자동 적용되는 할인입니다. 자판기에는 🔥 표시와 할인가가 함께 표시되며, 쿠폰 할인과 <strong>중복 적용</strong>됩니다.</p>
+                <div id="sale-status" style="padding:12px 14px;border-radius:10px;background:rgba(108,92,231,.12);margin-bottom:15px;">
+                    {{ sale_summary or '현재 진행 중인 할인이 없습니다.' }}
+                </div>
+                <div class="form-group">
+                    <label>할인 유형</label>
+                    <select id="sale-type">
+                        <option value="percent" {{ 'selected' if sale.type == 'percent' else '' }}>정률 (%)</option>
+                        <option value="amount" {{ 'selected' if sale.type == 'amount' else '' }}>정액 (원)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>할인 값 (할인율 % 또는 할인 금액 원)</label>
+                    <input type="number" id="sale-value" min="1" value="{{ sale.value or 10 }}" oninput="updateSalePreview()">
+                </div>
+                <div class="form-group">
+                    <label>이벤트 이름 (선택 — 자판기 상단에 표시)</label>
+                    <input type="text" id="sale-label" value="{{ sale.label }}" placeholder="예: 주말 특가">
+                </div>
+                <div class="form-group">
+                    <label>종료 시각 (선택 — 비우면 수동 종료까지)</label>
+                    <input type="text" id="sale-ends-at" value="{{ sale.ends_at }}" placeholder="2026-12-31 23:59">
+                </div>
+                <button class="btn btn-primary" onclick="saveSale()">
+                    <i class="fas fa-play"></i> 할인 시작 / 변경
+                </button>
+                <button class="btn btn-danger" onclick="stopSale()">
+                    <i class="fas fa-stop"></i> 할인 종료
+                </button>
+            </div>
+            <div class="card">
+                <h3><i class="fas fa-calculator"></i> 할인 미리보기</h3>
+                <div class="form-group">
+                    <label>상품 가격 (원)</label>
+                    <input type="number" id="sale-preview-price" value="10000" oninput="updateSalePreview()">
+                </div>
+                <div id="sale-preview-result" style="color: #888;">할인 값을 입력하면 적용 가격이 표시됩니다.</div>
+            </div>
+        </div>
+
+        <!-- Stock Log Tab (입고 기록) -->
+        <div class="tab-content" id="tab-stocklog">
+            <div class="card">
+                <h3><i class="fas fa-boxes-stacked"></i> 입고 기록</h3>
+                <p style="color: #888; margin-bottom: 15px;">대시보드와 디스코드 <strong>키추가</strong> 명령으로 입고된 내역입니다.</p>
+                <button class="btn btn-primary btn-sm" onclick="loadStockLogs()">
+                    <i class="fas fa-rotate"></i> 새로고침
+                </button>
+                <div id="stock-logs-container" style="margin-top: 15px;">
+                    {% if stock_logs %}
+                    <table>
+                        <thead>
+                            <tr><th>시간</th><th>상품</th><th>수량</th><th>총 재고</th><th>경로</th><th>담당</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for log in stock_logs %}
+                            <tr>
+                                <td>{{ log.created_at }}</td>
+                                <td>{{ log.product_name }}</td>
+                                <td>+{{ log.count }}</td>
+                                <td>{{ log.total_stock }}</td>
+                                <td>{{ log.source }}</td>
+                                <td>{{ log.actor or '-' }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% else %}
+                    <p style="color: #888; text-align: center; padding: 20px;">입고 기록이 없습니다.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Audit Log Tab (감사 로그) -->
+        <div class="tab-content" id="tab-auditlog">
+            <div class="card">
+                <h3><i class="fas fa-clipboard-list"></i> 감사 로그</h3>
+                <p style="color: #888; margin-bottom: 15px;">포인트 지급/차감, 재고 추가, 할인, 쿠폰, 설정 변경 등 관리자 행동 기록입니다.</p>
+                <button class="btn btn-primary btn-sm" onclick="loadAuditLogs()">
+                    <i class="fas fa-rotate"></i> 새로고침
+                </button>
+                <div id="audit-logs-container" style="margin-top: 15px;">
+                    {% if audit_logs %}
+                    <table>
+                        <thead>
+                            <tr><th>시간</th><th>동작</th><th>대상</th><th>내용</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for log in audit_logs %}
+                            <tr>
+                                <td>{{ log.created_at }}</td>
+                                <td>{{ log.action }}</td>
+                                <td>{{ log.actor_name or log.actor_id or '-' }}</td>
+                                <td>{{ log.detail }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% else %}
+                    <p style="color: #888; text-align: center; padding: 20px;">감사 로그가 없습니다.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
         <!-- Settings Tab -->
         <div class="tab-content" id="tab-settings">
             <div class="card">
@@ -777,11 +918,13 @@
                 </div>
                 <div class="form-group">
                     <label>Discord 봇 토큰</label>
-                    <input type="password" id="set-discord-token" value="{{ settings.get('discord_token', '') }}" placeholder="봇 토큰 입력">
+                    <input type="password" id="set-discord-token" value="" placeholder="{{ '저장됨 — 변경하려면 새 토큰 입력' if settings.get('discord_token') else '봇 토큰 입력' }}">
+                    <small style="opacity:.7;display:block;margin-top:4px">보안상 저장된 토큰은 표시하지 않습니다. 비워두면 기존 값이 유지됩니다.</small>
                 </div>
                 <div class="form-group">
                     <label>관리자 비밀번호</label>
-                    <input type="password" id="set-admin-password" value="{{ settings.get('admin_password', 'admin1234') }}">
+                    <input type="password" id="set-admin-password" value="" placeholder="{{ '저장됨 — 변경하려면 새 비밀번호 입력' if settings.get('admin_password_hash') else '비밀번호 입력' }}">
+                    <small style="opacity:.7;display:block;margin-top:4px">비밀번호는 해시(PBKDF2)로 저장됩니다. 비워두면 기존 값이 유지됩니다.</small>
                 </div>
                 <div class="form-group">
                     <label>대시보드 URL (24시간 핑용)</label>

@@ -86,6 +86,7 @@
         <div class="error">{{ error }}</div>
         {% endif %}
         <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="password" name="password" placeholder="관리자 비밀번호" required autofocus>
             <button type="submit">로그인</button>
         </form>
