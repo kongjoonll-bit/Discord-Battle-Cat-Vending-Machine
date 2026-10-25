@@ -974,6 +974,16 @@
                     <input type="password" id="set-discord-token" value="" placeholder="{{ '저장됨 — 변경하려면 새 토큰 입력' if settings.get('discord_token') else '봇 토큰 입력' }}">
                     <small style="opacity:.7;display:block;margin-top:4px">보안상 저장된 토큰은 표시하지 않습니다. 비워두면 기존 값이 유지됩니다.</small>
                 </div>
+                <div class="card" style="margin-bottom:16px;background:rgba(255,255,255,.03)">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                        <b><i class="fas fa-stethoscope"></i> 봇 로그인 진단</b>
+                        <button class="btn btn-sm" type="button" onclick="checkBotDiag()"><i class="fas fa-play"></i> 진단 실행</button>
+                    </div>
+                    <div id="bot-diag-result" style="margin-top:10px;font-size:13px;line-height:1.6;opacity:.92">
+                        봇이 로그인하지 못할 때 여기서 <b>토큰 문제인지 서버 IP 차단(1015)인지</b> 바로 확인할 수 있습니다.
+                        (토큰 원문은 표시하지 않고 지문만 보여줍니다)
+                    </div>
+                </div>
                 <div class="form-group">
                     <label>관리자 비밀번호</label>
                     <input type="password" id="set-admin-password" value="" placeholder="{{ '저장됨 — 변경하려면 새 비밀번호 입력' if settings.get('admin_password_hash') else '비밀번호 입력' }}">

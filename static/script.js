@@ -495,6 +495,54 @@ async function testDepositWebhook() {
     }
 }
 
+// ============ 봇 로그인 진단 (토큰 vs IP 차단 판별) ============
+async function checkBotDiag() {
+    const box = document.getElementById('bot-diag-result');
+    if (!box) return;
+    box.innerHTML = '<span style="color:#888;">확인 중... (디스코드 API에 실제 요청)</span>';
+    try {
+        const resp = await fetch('/api/bot-diag');
+        const data = await resp.json();
+        const labels = {
+            ok: ['#2ecc71', '✅ 토큰 정상'],
+            invalid_token: ['#e74c3c', '❌ 토큰 무효 (401)'],
+            cloudflare_block: ['#f39c12', '⚠️ 서버 IP 차단 (Cloudflare 1015)'],
+            rate_limit: ['#f39c12', '⏳ 요청 과다 (429)'],
+            no_token: ['#e74c3c', '❌ 토큰 미설정'],
+            network_error: ['#e74c3c', '❌ 네트워크 오류']
+        };
+        const lv = labels[data.verdict] || ['#f39c12', '⚠️ ' + (data.verdict || '알 수 없음')];
+        const t = data.token || {};
+        const login = data.login || {};
+        let html = '<div style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.25);border-radius:8px;padding:10px;line-height:1.8;">';
+        html += '<b style="color:' + lv[0] + ';font-size:13px;">' + lv[1] + '</b>'
+            + (data.http_status ? ' <span style="color:#888;">(HTTP ' + data.http_status + ')</span>' : '') + '<br>';
+        html += (data.detail || '') + '<br>';
+        if (data.bot_name) html += '봇 계정: <b>' + data.bot_name + '</b><br>';
+        html += '사용 토큰: <b>' + (data.token_source || '-') + '</b>　|　'
+            + '길이 ' + (t.length || 0) + '자　|　지문 <b>' + (t.fingerprint || '-') + '</b><br>';
+        html += '형식: ' + (t.looks_like_bot_token ? '<span style="color:#2ecc71;">정상(AAA.BBB.CCC)</span>' : '<span style="color:#f39c12;">비정상 — 토큰 값 확인</span>')
+            + '　|　Bot 접두사 ' + (t.has_bot_prefix ? '<span style="color:#e74c3c;">있음(제거 필요)</span>' : '없음')
+            + '　|　앞뒤 공백 ' + (t.had_whitespace ? '<span style="color:#e74c3c;">있음</span>' : '없음')
+            + '　|　따옴표 ' + (t.had_quotes ? '<span style="color:#e74c3c;">있음</span>' : '없음') + '<br>';
+        if (data.tokens_match === true) {
+            html += '환경변수 ↔ 대시보드 저장값: <span style="color:#2ecc71;">동일</span><br>';
+        } else if (data.tokens_match === false) {
+            html += '환경변수 ↔ 대시보드 저장값: <span style="color:#f39c12;">서로 다름</span> — 실제로는 <b>' + data.token_source + '</b>이(가) 쓰입니다<br>';
+        }
+        html += '마지막 로그인 시도: ' + (login.last_attempt_at || '-')
+            + ' (시도 #' + (login.attempts || 0) + ')'
+            + '　|　결과: <b>' + (login.last_kind || (login.login_ok_at ? 'ok' : '-')) + '</b><br>';
+        if (login.login_ok_at) html += '로그인 성공: ' + login.login_ok_at + ' (' + (login.logged_in_as || '') + ')<br>';
+        if (login.last_error) html += '<span style="color:#e74c3c;">최근 오류: ' + String(login.last_error).replace(/</g, '&lt;') + '</span><br>';
+        html += '봇 준비 상태(Render 기준): <b>' + (login.bot_ready ? '준비됨' : '아직 미연결') + '</b>';
+        html += '</div>';
+        box.innerHTML = html;
+    } catch (e) {
+        box.innerHTML = '<span style="color:#e74c3c;">❌ 진단 요청 실패: ' + e + '</span>';
+    }
+}
+
 async function loadWebhookLogs() {
     const container = document.getElementById('webhook-logs-container');
     if (!container) return;

@@ -26,6 +26,7 @@ import requests
 
 import discord
 import database as db
+import bot as bot_module
 from bot import VendingBot
 from toss_deposit import TossDepositMonitor
 
@@ -812,6 +813,11 @@ def api_update_settings():
             # 빈 값/마스킹된 값은 "변경 안 함" (실수로 토큰이 지워지는 것 방지)
             if not str(value or '').strip() or '•' in str(value):
                 continue
+        if key == 'discord_token':
+            # 붙여넣기 사고(공백/따옴표/'Bot ' 접두사)를 저장 단계에서 제거
+            value, _notes = bot_module.sanitize_token(str(value or ''))
+            if _notes:
+                logger.warning(f"[SETTINGS] 봇 토큰 자동 정리: {', '.join(_notes)}")
         db.set_setting(key, value)
         updated.append(key)
 
@@ -1374,6 +1380,91 @@ def api_net_diag():
         'bot_ready': bot.is_ready() if bot else False,
         'bot_user': str(bot.user) if getattr(bot, 'user', None) else '',
         'rate_limited': bot._is_rate_limited() if bot else False,
+        'login': bot_module.get_login_state(),
+    })
+
+
+@app.route('/api/bot-diag', methods=['GET'])
+@login_required
+def api_bot_diag():
+    """봇 로그인 진단 — 토큰 문제인지 IP(Cloudflare 1015) 차단인지 즉시 판별
+
+    - 토큰 원문은 절대 돌려주지 않고 지문(sha256 앞 12자)만 노출한다.
+      Render 환경변수와 대시보드 저장값의 지문을 비교하면 값이 같은지 알 수 있다.
+    - 실제 디스코드 API(/users/@me)를 한 번 호출해 401(토큰 무효)과
+      403/1015(IP 차단)를 구분한다.
+    """
+    env_token = (os.environ.get('DISCORD_TOKEN') or '')
+    db_token = (db.get_setting('discord_token', '') or '')
+    token, notes = bot_module.sanitize_token(env_token.strip() or db_token.strip())
+    if env_token.strip():
+        source = 'DISCORD_TOKEN 환경변수'
+    elif db_token.strip():
+        source = '대시보드 저장값'
+    else:
+        source = '없음'
+    if notes:
+        source += ' (자동 정리: ' + ', '.join(notes) + ')'
+
+    verdict = ''
+    http_status = None
+    bot_name = ''
+    detail = ''
+
+    if not token:
+        verdict = 'no_token'
+        detail = ('토큰이 비어 있습니다. Render Environment에 DISCORD_TOKEN을 추가하거나 '
+                  '아래 "Discord 봇 토큰"에 입력 후 설정을 저장하세요.')
+    else:
+        try:
+            resp = requests.get(
+                'https://discord.com/api/v10/users/@me',
+                headers={
+                    'Authorization': 'Bot ' + token,
+                    'User-Agent': 'DiscordBot (vending-dashboard, 1.0)',
+                },
+                timeout=10,
+            )
+            http_status = resp.status_code
+            body = (resp.text or '')[:300]
+            if http_status == 200:
+                data = resp.json() or {}
+                bot_name = f"{data.get('username')} (ID: {data.get('id')})"
+                verdict = 'ok'
+                detail = ('토큰은 정상입니다. 그래도 봇이 안 뜨면 서버 IP 차단(1015) 또는 '
+                          'Developer Portal의 Privileged Intents(SERVER MEMBERS / MESSAGE CONTENT) 설정을 확인하세요.')
+            elif http_status == 401:
+                verdict = 'invalid_token'
+                detail = ('디스코드가 토큰을 거부했습니다(401 Invalid Token). '
+                          'Developer Portal → Bot → Reset Token 후 새 값을 넣고, '
+                          '앞뒤 공백·따옴표·"Bot " 접두사가 없는지 확인하세요.')
+            elif http_status == 429:
+                verdict = 'rate_limit'
+                detail = '요청 한도(429)에 걸렸습니다. 1~2분 후 다시 진단하세요.'
+            elif http_status == 403 or '1015' in body or 'cloudflare' in body.lower():
+                verdict = 'cloudflare_block'
+                detail = ('서버 IP가 디스코드 앞단 Cloudflare에서 차단됐습니다(1015). '
+                          '토큰 문제가 아니며, 자동 해제되거나 고정 IP 환경으로 옮겨야 합니다.')
+            else:
+                verdict = 'http_' + str(http_status)
+                detail = '예상하지 못한 응답: ' + body
+        except Exception as e:
+            verdict = 'network_error'
+            detail = f'{type(e).__name__}: {e}'
+
+    return jsonify({
+        'verdict': verdict,
+        'http_status': http_status,
+        'bot_name': bot_name,
+        'detail': detail,
+        'token_source': source,
+        'token': bot_module.token_fingerprint(token),
+        'env_token': bot_module.token_fingerprint(env_token),
+        'db_token': bot_module.token_fingerprint(db_token),
+        'tokens_match': (bot_module.token_fingerprint(env_token).get('fingerprint')
+                         == bot_module.token_fingerprint(db_token).get('fingerprint')
+                         if env_token.strip() and db_token.strip() else None),
+        'login': bot_module.get_login_state(),
     })
 
 
@@ -1390,7 +1481,11 @@ def api_get_stats():
 # ============ STARTUP ============
 def start_bot():
     """Start the Discord bot"""
-    token = os.environ.get('DISCORD_TOKEN', db.get_setting('discord_token', ''))
+    token = os.environ.get('DISCORD_TOKEN') or db.get_setting('discord_token', '')
+    # 공백/따옴표/'Bot ' 접두사가 섞인 값은 여기서 정리 (401 방지)
+    token, notes = bot_module.sanitize_token(token)
+    if notes:
+        logger.warning(f"[BOT] 토큰 값 자동 정리: {', '.join(notes)} (값은 로그에 남기지 않음)")
     if not token:
         logger.warning("Discord token not set. Bot will not start.")
         return

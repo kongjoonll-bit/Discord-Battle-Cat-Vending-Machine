@@ -137,6 +137,84 @@ def _message_has_vending_components(msg):
             stack.extend(children)
     return False
 
+# ---- 로그인 상태 추적 (대시보드 '봇 로그인 진단'에서 사용) ----
+# run_bot이 재시도할 때마다 새 인스턴스를 만들기 때문에, 상태는 인스턴스가 아니라
+# 모듈 전역에 둬야 대시보드에서 최신 시도 결과를 볼 수 있다.
+LOGIN_STATE = {
+    'attempts': 0,
+    'last_kind': '',        # invalid_token | cloudflare_ban | rate_limit | other
+    'last_error': '',
+    'last_attempt_at': '',
+    'login_ok_at': '',
+    'logged_in_as': '',
+}
+
+# 현재 살아있는(또는 마지막으로 시도한) 봇 인스턴스 - 재시도마다 교체된다
+_BOT_INSTANCE = None
+
+
+def _now_str():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def get_login_state():
+    """로그인 시도 상태 스냅샷 (대시보드 진단용)"""
+    state = dict(LOGIN_STATE)
+    instance = _BOT_INSTANCE
+    state['bot_ready'] = bool(instance and instance.is_ready())
+    state['bot_user'] = str(instance.user) if (instance and getattr(instance, 'user', None)) else ''
+    return state
+
+
+def sanitize_token(token):
+    """붙여넣기 사고 방지: 앞뒤 공백/따옴표 제거 + 'Bot ' 접두사 제거
+
+    Render 환경변수에 토큰을 붙여넣을 때 `"OTk..."`, `Bot OTk...`, 줄바꿈이
+    섞이면 디스코드가 401을 돌려준다. 값을 자동으로 정리해 이런 실수를 없앤다.
+
+    Returns: (정리된 토큰, 적용된 정리 항목 리스트)
+    """
+    raw = token or ''
+    clean = raw.strip()
+    notes = []
+    if clean != raw:
+        notes.append('앞뒤 공백/줄바꿈 제거')
+    if len(clean) >= 2 and ((clean[0] == '"' and clean[-1] == '"')
+                            or (clean[0] == "'" and clean[-1] == "'")):
+        clean = clean[1:-1].strip()
+        notes.append('따옴표 제거')
+    if clean.lower().startswith('bot '):
+        clean = clean[4:].strip()
+        notes.append("'Bot ' 접두사 제거")
+    return clean, notes
+
+
+def token_fingerprint(token):
+    """토큰 원문을 노출하지 않고 '같은 값인지'만 비교할 수 있는 지문
+
+    Render 환경변수와 대시보드 저장값이 실제로 동일한지, 앞뒤 공백·따옴표·
+    'Bot ' 접두사가 섞여 들어갔는지 확인하기 위한 진단용 정보다.
+    """
+    raw = token or ''
+    clean = raw.strip().strip('"').strip("'").strip()
+    if not clean:
+        return {
+            'set': False, 'length': 0, 'fingerprint': '',
+            'has_bot_prefix': False, 'had_whitespace': False,
+            'had_quotes': False, 'looks_like_bot_token': False,
+        }
+    return {
+        'set': True,
+        'length': len(clean),
+        'fingerprint': hashlib.sha256(clean.encode('utf-8')).hexdigest()[:12],
+        'has_bot_prefix': clean.lower().startswith('bot '),
+        'had_whitespace': raw != clean,
+        'had_quotes': ('"' in raw) or ("'" in raw),
+        # 디스코드 봇 토큰은 보통 'AAA.BBB.CCC' 형태(3마디, 50자 이상)
+        'looks_like_bot_token': len(clean) >= 50 and clean.count('.') == 2,
+    }
+
+
 # ---- 로그인 실패 원인 분류 / 재시도 백오프 (Cloudflare 1015 = 공유 IP 차단 대응) ----
 def _classify_login_error(err):
     """봇 로그인 실패 원인 분류
@@ -223,6 +301,8 @@ def _publish_bot_instance(instance):
 
     Returns: 전역 참조를 교체했는지 여부
     """
+    global _BOT_INSTANCE
+    _BOT_INSTANCE = instance  # 진단(/api/bot-diag)에서 최신 인스턴스를 보도록 기록
     import sys
     bot_cls = globals().get('VendingBot')
     replaced = False
@@ -380,6 +460,11 @@ class VendingBot(commands.Bot):
     async def on_ready(self):
         first_ready = not self.ready_event.is_set()
         logger.info(f"Bot logged in as {self.user} (ID: {self.user.id}) - {BOT_VERSION}")
+        # 대시보드 진단용 로그인 성공 기록
+        LOGIN_STATE['login_ok_at'] = _now_str()
+        LOGIN_STATE['logged_in_as'] = f"{self.user} (ID: {self.user.id})"
+        LOGIN_STATE['last_kind'] = ''
+        LOGIN_STATE['last_error'] = ''
         self.ready_event.set()
         try:
             await self.change_presence(activity=discord.Game(name=f"냥코 KEY 자판기 🐱 | {BOT_VERSION}"))
@@ -835,11 +920,31 @@ class VendingBot(commands.Bot):
         run()이 실패하면 aiohttp 세션이 닫혀 재사용이 불가능하기 때문이다
         (같은 인스턴스로 다시 run → RuntimeError('Session is closed')).
         """
+        # 붙여넣기 사고(공백/따옴표/'Bot ' 접두사)로 401이 나는 걸 방지
+        token, _token_notes = sanitize_token(token)
+        if _token_notes:
+            logger.warning(f"[BOT] 토큰 값 자동 정리: {', '.join(_token_notes)} (값은 로그에 남기지 않음)")
+        if not token:
+            LOGIN_STATE['last_kind'] = 'invalid_token'
+            LOGIN_STATE['last_error'] = '토큰이 비어 있습니다 (정리 후 빈 문자열)'
+            LOGIN_STATE['last_attempt_at'] = _now_str()
+            logger.error("[BOT] 토큰이 비어 있어 봇을 시작할 수 없습니다. DISCORD_TOKEN을 설정하세요.")
+            return None
+
         def _run():
             attempt = 0
             instance = self
             while True:
                 attempt += 1
+                # 대시보드 진단용 상태 기록 (재시도마다 갱신)
+                LOGIN_STATE['attempts'] = attempt
+                LOGIN_STATE['last_attempt_at'] = _now_str()
+                if attempt == 1:
+                    fp = token_fingerprint(token)
+                    logger.info(
+                        f"[BOT] 토큰 지문={fp.get('fingerprint') or '-'} 길이={fp.get('length')} "
+                        f"Bot접두사={fp.get('has_bot_prefix')} 공백={fp.get('had_whitespace')} "
+                        f"따옴표={fp.get('had_quotes')} 형식정상={fp.get('looks_like_bot_token')}")
                 if attempt > 1:
                     # 재시도는 반드시 새 인스턴스로. 같은 Client를 다시 run()하면
                     # aiohttp 세션이 닫혀 있어 RuntimeError('Session is closed')가
@@ -860,11 +965,23 @@ class VendingBot(commands.Bot):
                 except Exception as e:
                     kind = _classify_login_error(e)
                     delay = _login_retry_delay(kind, attempt)
+                    # 진단용 상태 기록 (토큰 원문이 메시지에 섞여도 마스킹)
+                    try:
+                        err_text = str(e)
+                        if token and token in err_text:
+                            err_text = err_text.replace(token, '***')
+                        LOGIN_STATE['last_kind'] = kind
+                        LOGIN_STATE['last_error'] = err_text[:300]
+                    except Exception:
+                        pass
                     if kind == 'invalid_token':
+                        fp = token_fingerprint(token)
                         logger.error(
                             "[BOT] 디스코드 토큰이 유효하지 않습니다. "
                             "대시보드 설정 또는 DISCORD_TOKEN 환경변수를 확인하세요. "
-                            f"({delay:.0f}초 후 재확인)")
+                            f"(지문={fp.get('fingerprint') or '-'} 길이={fp.get('length')} "
+                            f"Bot접두사={fp.get('has_bot_prefix')} 공백={fp.get('had_whitespace')} "
+                            f"따옴표={fp.get('had_quotes')} | {delay:.0f}초 후 재확인)")
                     elif kind == 'cloudflare_ban':
                         hint = "" if instance.proxy_label else (
                             " Render 공유 IP라 남의 남용에 휘말린 상태입니다. "

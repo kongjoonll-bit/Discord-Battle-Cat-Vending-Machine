@@ -114,6 +114,7 @@ __pycache__/
 ├── toss_deposit.py         # 토스 입금 알림 전용 파서 (Tasker 전용)
 ├── bot.py                  # Discord 봇 (버튼 자판기)
 ├── database.py             # SQLite 데이터베이스
+├── check_token.py          # 디스코드 봇 토큰만 검증하는 CLI (봇/웹서버 없이)
 ├── test_deposit_parser.py  # 입금 파서 셀프 테스트
 ├── requirements.txt        # 의존성 패키지
 ├── render.yaml             # Render 배포 설정
@@ -207,6 +208,43 @@ Error 1015 ... You are being rate limited
 - `bot.py`는 이 상황을 감지하면 죽지 않고 **지수 백오프(60초 → 최대 15분)로 자동 재시도**합니다.
   로그에 `[BOT] Cloudflare 1015 감지 ... N초 후 재시도`가 반복되면 차단이 아직 풀리지 않은 것입니다.
 
+### 먼저 30초 안에 "토큰 문제인지" 확인
+
+로그에 `[BOT] 디스코드 토큰이 유효하지 않습니다`가 찍히면 **진짜 토큰 문제**입니다.
+`[BOT] Cloudflare 1015 감지`가 찍히면 **IP 차단**이라 토큰을 바꿔도 해결되지 않습니다.
+
+| 확인 방법 | 사용 시점 |
+|-----------|-----------|
+| 대시보드 → **설정** 탭 → **봇 로그인 진단 → 진단 실행** | 가장 간단. `verdict`가 `invalid_token` / `cloudflare_block` / `ok` 중 무엇인지 바로 표시 |
+| `GET /api/bot-diag` (관리자 세션) | 같은 결과를 JSON으로. 토큰 원문 대신 지문(sha256 앞 12자)·길이·형식만 노출 |
+| `python check_token.py` (로컬/Render Shell) | 봇을 띄우지 않고 토큰만 검증. `--offline`은 형식만 점검 |
+
+```bash
+python check_token.py                 # DISCORD_TOKEN 환경변수/.env 사용
+python check_token.py --token "OTk..."  # 직접 지정 (쉘 히스토리에 남음)
+python check_token.py --offline       # 네트워크 없이 형식(AAA.BBB.CCC/공백/따옴표/"Bot " 접두사)만
+```
+
+진단 결과별 조치:
+
+| 진단 결과 | 의미 | 조치 |
+|-----------|------|------|
+| `ok` (HTTP 200) | 토큰 정상 | 아래 IP 차단 / Privileged Intents 확인 |
+| `invalid_token` (HTTP 401) | 토큰 무효 | Developer Portal → Bot → **Reset Token** → 새 값으로 교체 후 재배포 |
+| `cloudflare_block` (403/1015) | 서버 IP 차단 | 토큰 문제 아님. 아래 해결 방법 참고 |
+| `no_token` | 토큰 미설정 | Render Environment에 `DISCORD_TOKEN` 추가 |
+| `rate_limit` (429) | 요청 과다 | 1~2분 후 재확인 |
+
+토큰이 401인데 값이 맞다고 생각된다면 대부분 아래 4가지입니다.
+
+1. **Reset Token 이후 예전 값을 계속 쓰는 경우** — 재발급하면 이전 토큰은 즉시 무효화됩니다.
+2. **앞뒤 공백/줄바꿈/따옴표**가 함께 붙은 경우 (Render Environment 붙여넣기에서 흔함).
+3. **`Bot ` 접두사**를 포함해 넣은 경우 (`Authorization: Bot Bot ...`이 되어 401).
+4. **봇 토큰이 아니라** Application ID / Public Key / Client Secret 을 넣은 경우.
+
+> 진단 화면의 **지문(12자)** 은 Render 환경변수와 대시보드 저장값이 실제로 같은지 비교하는 용도입니다.
+> 두 지문이 다르면 실제로는 `DISCORD_TOKEN` 환경변수 값이 사용됩니다(환경변수 우선).
+
 ### 해결 방법 (확실한 순서)
 
 | 방법 | 비용 | 설명 |
@@ -236,9 +274,11 @@ BOT_LOGIN_MAX_BACKOFF=900            # (선택) 로그인 재시도 최대 대�
 로그인 후 `GET /api/net-diag` (관리자 세션 필요):
 
 ```json
-{"outbound_ip":"216.24.x.x","proxy":"","bot_ready":false,"rate_limited":false}
+{"outbound_ip":"216.24.x.x","proxy":"","bot_ready":false,"rate_limited":false,
+ "login":{"attempts":3,"last_kind":"cloudflare_ban","last_attempt_at":"2026-10-25 20:31:02"}}
 ```
 
 `outbound_ip`가 Render 기본 대역이면 공유 IP를 쓰는 중입니다.
+토큰 자체의 유효성까지 함께 보려면 `GET /api/bot-diag` 또는 대시보드 **설정 → 봇 로그인 진단**을 사용하세요.
 
 - `PyNaCl is not installed, voice will NOT be supported` / `davey is not installed` 경고는 **음성 기능을 쓰지 않으면 무해**합니다.
