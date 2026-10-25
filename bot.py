@@ -62,6 +62,21 @@ def resolve_button_emoji(client, raw):
     return emoji
 
 
+def product_icon(raw, default='📦'):
+    """상품/헤더 이모지 설정값을 안전한 표시값으로 변환
+
+    - 유니코드 이모지 → 그대로
+    - 커스텀 이모지(<:name:id>) → PartialEmoji (버튼/셀렉트에서 사용)
+    - 이름 없는 ID만 있는 값 등 사용할 수 없는 값 → default
+    """
+    emoji = parse_button_emoji(raw)
+    if emoji is None:
+        return default
+    if isinstance(emoji, discord.PartialEmoji) and not getattr(emoji, 'name', None):
+        return default
+    return emoji
+
+
 def format_price_text(price):
     """상품 가격 표시 (전체 할인 적용 시 원가 취소선 + 할인가)"""
     try:
@@ -91,15 +106,16 @@ def _vending_content_signature():
     """
     parts = []
     for key in ('vending_title', 'vending_desc', 'vending_footer', 'vending_color',
-                'vending_banner_url', 'use_categories',
+                'vending_banner_url', 'use_categories', 'vending_emoji', 'attendance_points',
                 'btn_emoji_product', 'btn_emoji_charge', 'btn_emoji_info', 'btn_emoji_ticket',
-                'btn_emoji_category', 'sale_active', 'sale_type', 'sale_value',
+                'btn_emoji_category', 'btn_emoji_attendance', 'btn_emoji_mykeys',
+                'btn_emoji_ranking', 'sale_active', 'sale_type', 'sale_value',
                 'sale_label', 'sale_ends_at'):
         parts.append(f"{key}={db.get_setting(key, '')}")
     for p in db.get_products(active_only=True):
         parts.append(
             f"p={p['id']}|{p['name']}|{p['price']}|{p.get('category', '')}"
-            f"|{p.get('description', '')}|{db.count_available_keys(p['id'])}"
+            f"|{p.get('description', '')}|{p.get('emoji', '')}|{db.count_available_keys(p['id'])}"
         )
     for cat in db.get_categories():
         parts.append(f"c={cat}|{len(db.get_products_by_category(cat, active_only=True))}")
@@ -160,6 +176,15 @@ def _login_retry_delay(kind, attempt):
     return delay * random.uniform(0.9, 1.1)
 
 
+def _sleep_before_retry(delay):
+    """재시도 전 대기 - 인터프리터 종료/중단 시 True(재시도 중지) 반환"""
+    try:
+        time.sleep(delay)
+        return False
+    except Exception:
+        return True
+
+
 def _proxy_settings():
     """DISCORD_PROXY / DISCORD_PROXY_AUTH 환경변수(또는 설정값) → (url, auth, 라벨)
 
@@ -185,6 +210,40 @@ def _proxy_settings():
     except Exception as e:
         logger.warning(f"[BOT] 프록시 설정 해석 실패(무시하고 직접 연결): {e}")
         return None, None, ''
+
+
+def _publish_bot_instance(instance):
+    """main 모듈의 전역 `bot` 참조를 새 인스턴스로 교체
+
+    discord.py의 Client는 한 번 run()이 실패/종료되면 재사용할 수 없다
+    (aiohttp 세션이 닫혀 `RuntimeError('Session is closed')` 발생).
+    그래서 로그인 재시도 때마다 VendingBot을 새로 만들어야 하는데,
+    그때 대시보드(main.py)가 들고 있는 전역 참조도 같이 갈아주지 않으면
+    DM 전송·자판기 갱신이 죽은 인스턴스를 계속 바라보게 된다.
+
+    Returns: 전역 참조를 교체했는지 여부
+    """
+    import sys
+    bot_cls = globals().get('VendingBot')
+    replaced = False
+    for module_name in ('main', '__main__'):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        old = getattr(module, 'bot', None)
+        if old is instance:
+            replaced = True
+            continue
+        if bot_cls is not None and not isinstance(old, bot_cls):
+            continue  # 봇 전역이 아직 없거나 다른 객체면 건드리지 않는다
+        try:
+            setattr(module, 'bot', instance)
+            replaced = True
+        except Exception as e:
+            logger.warning(f"[BOT] 전역 봇 참조 교체 실패({module_name}): {e}")
+    if replaced:
+        logger.info("[BOT] 재시도용 새 봇 인스턴스로 전역 참조 교체 완료")
+    return replaced
 
 
 class VendingBot(commands.Bot):
@@ -771,14 +830,31 @@ class VendingBot(commands.Bot):
         Render 무료 플랜처럼 공유 IP를 쓰는 환경에서는 Cloudflare가 discord.com
         로그인 요청을 Error 1015(HTML)로 막는 경우가 있다. 이때 즉시 재시도하면
         차단이 더 길어지므로, 지수 백오프(최대 15분)로 계속 재시도한다.
+
+        재시도는 매번 **새 VendingBot 인스턴스**로 한다. discord.py의 Client는
+        run()이 실패하면 aiohttp 세션이 닫혀 재사용이 불가능하기 때문이다
+        (같은 인스턴스로 다시 run → RuntimeError('Session is closed')).
         """
         def _run():
             attempt = 0
+            instance = self
             while True:
                 attempt += 1
+                if attempt > 1:
+                    # 재시도는 반드시 새 인스턴스로. 같은 Client를 다시 run()하면
+                    # aiohttp 세션이 닫혀 있어 RuntimeError('Session is closed')가
+                    # 즉시 발생한다 (discord.py Client는 재시작 불가).
+                    try:
+                        instance = type(self)()
+                        _publish_bot_instance(instance)
+                    except Exception as e:
+                        logger.error(f"[BOT] 봇 인스턴스 재생성 실패: {e}")
+                        if _sleep_before_retry(_login_retry_delay('other', attempt)):
+                            return
+                        continue
                 try:
                     logger.info(f"[BOT] 디스코드 로그인 시도 #{attempt}")
-                    self.run(token)
+                    instance.run(token)
                     logger.info("[BOT] 봇 세션이 정상 종료되었습니다.")
                     return
                 except Exception as e:
@@ -790,7 +866,7 @@ class VendingBot(commands.Bot):
                             "대시보드 설정 또는 DISCORD_TOKEN 환경변수를 확인하세요. "
                             f"({delay:.0f}초 후 재확인)")
                     elif kind == 'cloudflare_ban':
-                        hint = "" if self.proxy_label else (
+                        hint = "" if instance.proxy_label else (
                             " Render 공유 IP라 남의 남용에 휘말린 상태입니다. "
                             "DISCORD_PROXY 환경변수로 다른 IP를 쓰거나, 고정 IP 환경(VPS/Oracle 무료 티어)으로 이전하면 해결됩니다.")
                         logger.warning(
@@ -1056,9 +1132,16 @@ class VendingMainView(ui.LayoutView):
         emoji_charge = parse_button_emoji(db.get_setting('btn_emoji_charge', '💰')) or '💰'
         emoji_info = parse_button_emoji(db.get_setting('btn_emoji_info', 'ℹ️')) or 'ℹ️'
         emoji_ticket = parse_button_emoji(db.get_setting('btn_emoji_ticket', '🎫')) or '🎫'
+        emoji_attendance = parse_button_emoji(db.get_setting('btn_emoji_attendance', '📅')) or '📅'
+        emoji_mykeys = parse_button_emoji(db.get_setting('btn_emoji_mykeys', '🔑')) or '🔑'
+        emoji_ranking = parse_button_emoji(db.get_setting('btn_emoji_ranking', '🏆')) or '🏆'
+
+        # 자판기 헤더 이모지 (유니코드/서버 커스텀 이모지 모두 지원)
+        header_emoji = product_icon(db.get_setting('vending_emoji', '🐱'), '🐱')
+        header_text = f"{header_emoji} {title}" if header_emoji else title
 
         children = [
-            ui.TextDisplay(f"## {title}"),
+            ui.TextDisplay(f"## {header_text}"),
             ui.TextDisplay(desc),
         ]
         if sale_text:
@@ -1071,6 +1154,11 @@ class VendingMainView(ui.LayoutView):
                 VendingButton(label="충전", emoji=emoji_charge, style=discord.ButtonStyle.success, custom_id="vending_charge"),
                 VendingButton(label="정보", emoji=emoji_info, style=discord.ButtonStyle.secondary, custom_id="vending_info"),
                 VendingButton(label="문의", emoji=emoji_ticket, style=discord.ButtonStyle.danger, custom_id="vending_ticket"),
+            ),
+            ui.ActionRow(
+                VendingButton(label="출석", emoji=emoji_attendance, style=discord.ButtonStyle.success, custom_id="vending_attendance"),
+                VendingButton(label="내 키", emoji=emoji_mykeys, style=discord.ButtonStyle.secondary, custom_id="vending_mykeys"),
+                VendingButton(label="랭킹", emoji=emoji_ranking, style=discord.ButtonStyle.secondary, custom_id="vending_ranking"),
             ),
             ui.TextDisplay(status_text),
             ui.TextDisplay(f"-# {footer}"),
@@ -1118,7 +1206,7 @@ class CategorySelect(discord.ui.Select):
                     label=f"{p['name']} ({price_tag})"[:100],
                     description=detail[:100],
                     value=str(p['id']),
-                    emoji="🛒"
+                    emoji=product_icon(p.get('emoji'), "🛒")
                 ))
         
         if not options:
@@ -1171,7 +1259,8 @@ class CategorySelect(discord.ui.Select):
                 value = f"{icon} {price_line} · 재고 {stock}개"
                 if desc_line:
                     value += f"\n{desc_line}"
-                embed.add_field(name=p['name'], value=value, inline=False)
+                p_icon = product_icon(p.get('emoji'), "📦")
+                embed.add_field(name=f"{p_icon} {p['name']}", value=value, inline=False)
             
             await interaction.response.send_message(embed=embed, view=BuyProductView(cat_products), ephemeral=True)
         else:
@@ -1229,6 +1318,12 @@ class VendingButton(discord.ui.Button):
             await self.show_info(interaction)
         elif action == 'ticket':
             await self.show_ticket(interaction)
+        elif action == 'attendance':
+            await self.show_attendance(interaction)
+        elif action == 'mykeys':
+            await self.show_my_keys(interaction)
+        elif action == 'ranking':
+            await self.show_ranking(interaction)
     
     async def show_products(self, interaction):
         # defer 먼저 호출하여 interaction 3초 제한 초과 방지
@@ -1254,7 +1349,8 @@ class VendingButton(discord.ui.Button):
                 stock_text = f"{stock}개" if stock > 0 else "품절"
                 desc = (p.get('description') or '').strip().replace('\n', ' ')
                 suffix = f" · {desc}" if desc else ""
-                return f"• {p['name']} - {format_price_text(p['price'])} (재고: {stock_text}){suffix}"
+                icon = product_icon(p.get('emoji'), "•")
+                return f"{icon} {p['name']} - {format_price_text(p['price'])} (재고: {stock_text}){suffix}"
 
             # 카테고리 사용 여부 확인
             use_categories = db.get_setting('use_categories', 'false').lower() == 'true'
@@ -1493,6 +1589,101 @@ class VendingButton(discord.ui.Button):
                 f"❌ 티켓 생성 중 오류가 발생했습니다: {str(e)}",
                 ephemeral=True
             )
+
+    async def show_attendance(self, interaction):
+        """출석 체크 - 하루 1회 포인트 지급"""
+        await interaction.response.defer(ephemeral=True)
+        try:
+            points = int(str(db.get_setting('attendance_points', '100') or '100').strip())
+        except (TypeError, ValueError):
+            points = 100
+        points = max(0, min(points, 100000))
+
+        ok, days, earned = db.claim_attendance(str(interaction.user.id), interaction.user.name, points)
+        balance = db.get_balance(str(interaction.user.id))
+
+        if not ok:
+            embed = discord.Embed(
+                title="📅 오늘은 이미 출석했어요!",
+                description=f"출석은 **하루 1회**만 가능합니다.\n내일 다시 만나요! 🐱",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="누적 출석", value=f"{days}일", inline=True)
+            embed.add_field(name="현재 포인트", value=f"{balance:,}P", inline=True)
+        else:
+            embed = discord.Embed(
+                title="✅ 출석 체크 완료!",
+                description=f"**{earned:,}P**가 지급되었습니다!",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="누적 출석", value=f"{days}일", inline=True)
+            embed.add_field(name="현재 포인트", value=f"{balance:,}P", inline=True)
+        embed.set_footer(text="매일 출석하고 포인트를 모아보세요 🐱")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def show_my_keys(self, interaction):
+        """내가 구매한 키 다시보기"""
+        await interaction.response.defer(ephemeral=True)
+        orders = db.get_orders(user_id=str(interaction.user.id), limit=100)
+        delivered = [o for o in orders if o.get('key_id') and o.get('status') in ('completed', 'confirmed')]
+
+        if not delivered:
+            await interaction.followup.send(
+                "🔑 아직 구매한 키가 없습니다.\n제품 목록에서 원하는 상품을 구매해보세요!",
+                ephemeral=True
+            )
+            return
+
+        lines = []
+        for o in delivered[:10]:
+            full = db.get_order_with_key(o['id']) or {}
+            key_val = (full.get('key_value') or '키 정보 없음')
+            lines.append(f"• **{o['product_name']}** `{o['created_at']}`\n  `{key_val}`")
+
+        embed = discord.Embed(
+            title="🔑 내가 구매한 키",
+            description="\n".join(lines)[:4000],
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text=f"최근 10건 표시 · 총 {len(delivered)}건 구매")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def show_ranking(self, interaction):
+        """포인트/구매/출석 랭킹"""
+        await interaction.response.defer(ephemeral=True)
+        medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣']
+
+        top_balance = db.get_top_balances(5)
+        top_buyers = db.get_top_buyers(5)
+        top_attendance = db.get_attendance_top(5)
+
+        embed = discord.Embed(
+            title="🏆 자판기 랭킹",
+            description="상위 5명을 소개합니다!",
+            color=discord.Color.gold()
+        )
+
+        if top_balance:
+            lines = [f"{medals[i]} **{u['username'] or u['user_id']}** — {int(u['balance'] or 0):,}P"
+                     for i, u in enumerate(top_balance)]
+            embed.add_field(name="💰 보유 포인트", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="💰 보유 포인트", value="기록 없음", inline=False)
+
+        if top_buyers:
+            lines = [f"{medals[i]} **{u['username'] or u['user_id']}** — {int(u['total'] or 0):,}P ({int(u['orders'] or 0)}건)"
+                     for i, u in enumerate(top_buyers)]
+            embed.add_field(name="🛒 누적 구매", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="🛒 누적 구매", value="기록 없음", inline=False)
+
+        if top_attendance:
+            lines = [f"{medals[i]} **{u['username'] or u['user_id']}** — {int(u['days'] or 0)}일"
+                     for i, u in enumerate(top_attendance)]
+            embed.add_field(name="📅 출석 일수", value="\n".join(lines)[:1024], inline=False)
+
+        embed.set_footer(text="열심히 참여하고 포인트를 모아보세요 🐱")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class TicketView(discord.ui.View):
@@ -2266,6 +2457,12 @@ class VendingCommands(commands.Cog):
             db.add_admin(str(interaction.user.id), interaction.user.name)
             return True
         return db.is_admin(str(interaction.user.id))
+
+    def is_staff_check(self, interaction: discord.Interaction) -> bool:
+        """관리자 또는 서포터/매니저 여부 (주문 처리·재고 운영 권한)"""
+        if self.is_admin_check(interaction):
+            return True
+        return db.is_staff(str(interaction.user.id))
     
     # ============ ADMIN COMMANDS ============
     
@@ -2446,32 +2643,32 @@ class VendingCommands(commands.Cog):
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
-    @app_commands.command(name="수동확인", description="[관리자] 주문을 수동으로 확인합니다")
+    @app_commands.command(name="수동확인", description="[관리자/서포터] 주문을 수동으로 확인합니다")
     @app_commands.describe(order_id="확인할 주문번호")
     async def manual_confirm(self, interaction: discord.Interaction, order_id: int):
-        if not self.is_admin_check(interaction):
-            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True)
         success, msg = await self.bot.confirm_order(order_id)
         await interaction.followup.send(msg, ephemeral=True)
     
-    @app_commands.command(name="주문취소", description="[관리자] 주문을 취소합니다")
+    @app_commands.command(name="주문취소", description="[관리자/서포터] 주문을 취소합니다")
     @app_commands.describe(order_id="취소할 주문번호")
     async def cancel_order(self, interaction: discord.Interaction, order_id: int):
-        if not self.is_admin_check(interaction):
-            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True)
         success, msg = await self.bot.cancel_order(order_id)
         await interaction.followup.send(msg, ephemeral=True)
     
-    @app_commands.command(name="대기주문", description="[관리자] 대기 중인 주문 목록을 확인합니다")
+    @app_commands.command(name="대기주문", description="[관리자/서포터] 대기 중인 주문 목록을 확인합니다")
     async def pending_orders(self, interaction: discord.Interaction):
-        if not self.is_admin_check(interaction):
-            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
             return
         
         pending = db.get_pending_orders()
@@ -2492,16 +2689,20 @@ class VendingCommands(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
     
     @app_commands.command(name="상품추가", description="[관리자] 상품을 추가합니다")
-    @app_commands.describe(name="상품명", price="가격(포인트)", description="설명", category="카테고리")
-    async def add_product(self, interaction: discord.Interaction, name: str, price: int, description: str = "", category: str = ""):
+    @app_commands.describe(name="상품명", price="가격(포인트)", description="설명", category="카테고리",
+                           emoji="상품 이모지 (선택 · 🎁 / :cat: / <:cat:123456789012345678>)")
+    async def add_product(self, interaction: discord.Interaction, name: str, price: int,
+                          description: str = "", category: str = "", emoji: str = ""):
         if not self.is_admin_check(interaction):
             await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
-        
-        db.add_product(name, price, description, category=category)
+
+        emoji = (emoji or '').strip()
+        db.add_product(name, price, description, category=category, emoji=emoji)
         cat_text = f"\n📂 카테고리: {category}" if category else ""
+        emoji_text = f"\n{product_icon(emoji, '📦')} 이모지 적용" if emoji else ""
         await interaction.response.send_message(
-            f"✅ 상품이 추가되었습니다!\n**{name}** - {price:,}포인트{cat_text}", ephemeral=True)
+            f"✅ 상품이 추가되었습니다!\n**{name}** - {price:,}포인트{cat_text}{emoji_text}", ephemeral=True)
         await self.bot.refresh_vending_machines()
     
     @app_commands.command(name="상품삭제", description="[관리자] 상품을 삭제합니다")
@@ -2523,11 +2724,11 @@ class VendingCommands(commands.Cog):
         )
         await self.bot.refresh_vending_machines()
     
-    @app_commands.command(name="키추가", description="[관리자] 상품에 키를 추가합니다")
+    @app_commands.command(name="키추가", description="[관리자/서포터] 상품에 키를 추가합니다")
     @app_commands.describe(product_id="상품 ID", keys="키 목록 (줄바꿈으로 구분)")
     async def add_keys(self, interaction: discord.Interaction, product_id: int, keys: str):
-        if not self.is_admin_check(interaction):
-            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
             return
         
         product = db.get_product(product_id)
@@ -2821,4 +3022,308 @@ class VendingCommands(commands.Cog):
                 value=f"상태: 열림 | 생성: {t['created_at']}",
                 inline=False
             )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ============ STAFF (서포터 / 매니저) ============
+
+    @app_commands.command(name="서포터추가", description="[관리자] 서포터(운영진)를 지정합니다")
+    @app_commands.describe(user="서포터로 지정할 유저", role="권한 (서포터 = 주문/재고 운영, 매니저 = 관리자급)")
+    @app_commands.choices(role=[
+        app_commands.Choice(name="서포터 (주문 확인·취소, 재고 보충)", value="supporter"),
+        app_commands.Choice(name="매니저 (관리자급 운영)", value="manager"),
+    ])
+    async def add_staff_cmd(self, interaction: discord.Interaction, user: discord.User,
+                            role: app_commands.Choice[str] = None):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        chosen = role.value if role else 'supporter'
+        is_new = db.add_staff(str(user.id), user.name, chosen,
+                              added_by=f"{interaction.user.name}({interaction.user.id})")
+        label = db.STAFF_ROLE_LABELS.get(chosen, chosen)
+        db.add_audit_log('staff_add', str(interaction.user.id), interaction.user.name,
+                         f"{user.name}({user.id}) → {label}")
+
+        action = "지정" if is_new else "권한 변경"
+        embed = discord.Embed(
+            title=f"👥 서포터 {action} 완료",
+            description=f"{user.mention} 님이 **{label}**(으)로 {action}되었습니다.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="권한", value=(
+            "주문 확인/취소, 재고 조회, 키 추가" if chosen == 'supporter'
+            else "관리자급 운영 (서포터 권한 전체)"
+        ), inline=False)
+        embed.set_footer(text="해제는 /서포터제거 명령어로 가능합니다")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # 대상 유저에게 안내 DM
+        dm = discord.Embed(
+            title="👥 운영진으로 지정되었습니다!",
+            description=f"**{interaction.guild.name if interaction.guild else '서버'}**에서 "
+                        f"**{label}** 권한이 부여되었습니다.",
+            color=discord.Color.blurple()
+        )
+        dm.add_field(name="사용 가능한 명령어",
+                      value="`/대기주문` `/수동확인` `/주문취소` `/키추가` `/재고` `/서포터목록`",
+                      inline=False)
+        await self.bot.send_dm(user.id, embed=dm)
+
+    @app_commands.command(name="서포터제거", description="[관리자] 서포터 지정을 해제합니다")
+    @app_commands.describe(user="서포터 지정을 해제할 유저")
+    async def remove_staff_cmd(self, interaction: discord.Interaction, user: discord.User):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        staff = db.get_staff(str(user.id))
+        if not staff:
+            await interaction.response.send_message(f"❌ {user.mention} 님은 서포터가 아닙니다.", ephemeral=True)
+            return
+
+        db.remove_staff(str(user.id))
+        db.add_audit_log('staff_remove', str(interaction.user.id), interaction.user.name,
+                         f"{user.name}({user.id}) 해제")
+        label = db.STAFF_ROLE_LABELS.get(staff.get('role'), staff.get('role'))
+        await interaction.response.send_message(
+            f"✅ {user.mention} 님의 **{label}** 권한이 해제되었습니다.", ephemeral=True)
+        await self.bot.send_dm(user.id, embed=discord.Embed(
+            title="👥 운영진 권한이 해제되었습니다",
+            description="서포터/매니저 권한이 해제되었습니다. 그동안 수고 많으셨습니다!",
+            color=discord.Color.orange()
+        ))
+
+    @app_commands.command(name="서포터목록", description="[관리자/서포터] 등록된 서포터 목록을 확인합니다")
+    async def staff_list_cmd(self, interaction: discord.Interaction):
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        staff_list = db.get_staff_list()
+        embed = discord.Embed(
+            title="👥 서포터 / 매니저 목록",
+            color=discord.Color.blurple()
+        )
+        if not staff_list:
+            embed.description = "등록된 서포터가 없습니다.\n`/서포터추가` 로 운영진을 지정해보세요!"
+        else:
+            for s in staff_list[:20]:
+                label = db.STAFF_ROLE_LABELS.get(s.get('role'), s.get('role'))
+                icon = '🛡️' if s.get('role') == 'manager' else '👤'
+                embed.add_field(
+                    name=f"{icon} {s.get('username') or s.get('user_id')}",
+                    value=f"{label} · 지정자: {s.get('added_by') or '알 수 없음'}\n`{s.get('user_id')}`",
+                    inline=False
+                )
+            embed.set_footer(text=f"총 {len(staff_list)}명")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ============ USER COMMANDS (누구나 사용) ============
+
+    @app_commands.command(name="출석", description="하루 1회 출석하고 포인트를 받습니다")
+    async def attendance_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            points = int(str(db.get_setting('attendance_points', '100') or '100').strip())
+        except (TypeError, ValueError):
+            points = 100
+        points = max(0, min(points, 100000))
+
+        ok, days, earned = db.claim_attendance(str(interaction.user.id), interaction.user.name, points)
+        balance = db.get_balance(str(interaction.user.id))
+
+        if ok:
+            embed = discord.Embed(
+                title="✅ 출석 체크 완료!",
+                description=f"**{earned:,}P**가 지급되었습니다!",
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="📅 오늘은 이미 출석했어요!",
+                description="출석은 **하루 1회**만 가능합니다. 내일 다시 만나요! 🐱",
+                color=discord.Color.orange()
+            )
+        embed.add_field(name="누적 출석", value=f"{days}일", inline=True)
+        embed.add_field(name="현재 포인트", value=f"{balance:,}P", inline=True)
+        embed.set_footer(text="매일 출석하고 포인트를 모아보세요 🐱")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="내키", description="내가 구매한 키를 다시 확인합니다")
+    async def my_keys_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        orders = db.get_orders(user_id=str(interaction.user.id), limit=100)
+        delivered = [o for o in orders if o.get('key_id') and o.get('status') in ('completed', 'confirmed')]
+
+        if not delivered:
+            await interaction.followup.send(
+                "🔑 아직 구매한 키가 없습니다.\n자판기에서 원하는 상품을 구매해보세요!", ephemeral=True)
+            return
+
+        lines = []
+        for o in delivered[:10]:
+            full = db.get_order_with_key(o['id']) or {}
+            key_val = full.get('key_value') or '키 정보 없음'
+            lines.append(f"• **{o['product_name']}** `{o['created_at']}`\n  `{key_val}`")
+
+        embed = discord.Embed(
+            title="🔑 내가 구매한 키",
+            description="\n".join(lines)[:4000],
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text=f"최근 10건 표시 · 총 {len(delivered)}건 구매 (DM으로도 전송됩니다)")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await self.bot.send_dm(interaction.user.id, embed=embed)
+
+    @app_commands.command(name="랭킹", description="포인트·구매·출석 랭킹을 확인합니다")
+    async def ranking_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
+
+        embed = discord.Embed(
+            title="🏆 자판기 랭킹",
+            description="열심히 참여한 유저 TOP 10!",
+            color=discord.Color.gold()
+        )
+
+        top_balance = db.get_top_balances(10)
+        top_buyers = db.get_top_buyers(10)
+        top_attendance = db.get_attendance_top(10)
+
+        if top_balance:
+            lines = [f"{medals[i] if i < len(medals) else '•'} **{u['username'] or u['user_id']}** — {int(u['balance'] or 0):,}P"
+                     for i, u in enumerate(top_balance)]
+            embed.add_field(name="💰 보유 포인트", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="💰 보유 포인트", value="기록 없음", inline=False)
+
+        if top_buyers:
+            lines = [f"{medals[i] if i < len(medals) else '•'} **{u['username'] or u['user_id']}** — {int(u['total'] or 0):,}P ({int(u['orders'] or 0)}건)"
+                     for i, u in enumerate(top_buyers)]
+            embed.add_field(name="🛒 누적 구매", value="\n".join(lines)[:1024], inline=False)
+        else:
+            embed.add_field(name="🛒 누적 구매", value="기록 없음", inline=False)
+
+        if top_attendance:
+            lines = [f"{medals[i] if i < len(medals) else '•'} **{u['username'] or u['user_id']}** — {int(u['days'] or 0)}일"
+                     for i, u in enumerate(top_attendance)]
+            embed.add_field(name="📅 출석 일수", value="\n".join(lines)[:1024], inline=False)
+
+        embed.set_footer(text="매일 출석 + 구매로 랭킹에 도전하세요 🐱")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ============ STOCK / EMOJI / HELP ============
+
+    @app_commands.command(name="재고", description="[관리자/서포터] 상품별 재고 현황을 확인합니다")
+    async def stock_status_cmd(self, interaction: discord.Interaction):
+        if not self.is_staff_check(interaction):
+            await interaction.response.send_message("❌ 관리자 또는 서포터만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        products = db.get_products()
+        if not products:
+            await interaction.response.send_message("📦 등록된 상품이 없습니다.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="📦 상품별 재고 현황", color=discord.Color.blurple())
+        total = 0
+        for p in products[:20]:
+            stock = db.count_available_keys(p['id'])
+            total += stock
+            icon = '🟢' if stock > 0 else '🔴'
+            p_icon = product_icon(p.get('emoji'), '📦')
+            state = '판매중' if p['active'] else '판매중지'
+            embed.add_field(
+                name=f"{p_icon} {p['name']} (#{p['id']})",
+                value=f"{icon} 재고 **{stock}개** · {p['price']:,}원 · {state}",
+                inline=True
+            )
+        embed.set_footer(text=f"상품 {len(products)}개 · 총 재고 {total}개")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="상품이모지", description="[관리자] 상품 버튼에 표시할 이모지를 설정합니다")
+    @app_commands.describe(product_id="상품 ID",
+                           emoji="이모지 (🎁 / :cat: / <:cat:123456789012345678> / 이모지ID). 기본값으로 되돌리려면 none")
+    async def set_product_emoji(self, interaction: discord.Interaction, product_id: int, emoji: str):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        product = db.get_product(product_id)
+        if not product:
+            await interaction.response.send_message("❌ 상품을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        emoji = (emoji or '').strip()
+        if emoji.lower() in ('none', '없음', '기본', 'default', '-'):
+            emoji = ''
+        db.update_product(product_id, emoji=emoji)
+        db.add_audit_log('product_emoji', str(interaction.user.id), interaction.user.name,
+                         f"ID {product_id} / {product['name']} → {emoji or '기본값'}")
+
+        preview = product_icon(emoji, '📦')
+        await interaction.response.send_message(
+            f"✅ **{product['name']}** 이모지가 {preview} (으)로 설정되었습니다.\n"
+            f"자판기가 새로고침됩니다.",
+            ephemeral=True
+        )
+        await self.bot.refresh_vending_machines(force_edit=True)
+
+    @app_commands.command(name="자판기이모지", description="[관리자] 자판기 제목 앞에 표시할 이모지를 설정합니다")
+    @app_commands.describe(emoji="이모지 (🐱 / :cat: / <:cat:123456789012345678> / 이모지ID). 기본값으로 되돌리려면 none")
+    async def set_vending_emoji(self, interaction: discord.Interaction, emoji: str):
+        if not self.is_admin_check(interaction):
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        emoji = (emoji or '').strip()
+        if emoji.lower() in ('none', '없음', '기본', 'default', '-'):
+            emoji = ''
+        db.set_setting('vending_emoji', emoji)
+        db.add_audit_log('vending_emoji', str(interaction.user.id), interaction.user.name,
+                         f"자판기 이모지 → {emoji or '기본값🐱'}")
+
+        preview = product_icon(emoji, '🐱')
+        await interaction.response.send_message(
+            f"✅ 자판기 제목 이모지가 {preview} (으)로 설정되었습니다.", ephemeral=True)
+        await self.bot.refresh_vending_machines(force_edit=True)
+
+    @app_commands.command(name="도움말", description="자판기 사용 방법과 명령어 목록을 확인합니다")
+    async def help_cmd(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        embed = discord.Embed(
+            title="🐱 자판기 도움말",
+            description="버튼을 눌러 구매·충전·문의를 이용할 수 있습니다.",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(
+            name="🛒 구매 방법",
+            value="1️⃣ **충전** 버튼으로 입금 후 포인트 충전\n"
+                  "2️⃣ 카테고리/상품 선택\n"
+                  "3️⃣ 쿠폰이 있으면 **쿠폰 사용** → 없으면 바로 구매 확정\n"
+                  "4️⃣ 구매한 키는 **내 키** 버튼이나 DM으로 확인",
+            inline=False
+        )
+        embed.add_field(
+            name="🎁 유저 명령어",
+            value="`/출석` 하루 1회 포인트\n`/내키` 구매한 키 확인\n`/랭킹` 포인트·구매·출석 순위\n`/도움말` 이 도움말",
+            inline=False
+        )
+        if db.can_manage_orders(uid):
+            embed.add_field(
+                name="🛠️ 운영 명령어 (서포터/매니저)",
+                value="`/대기주문` `/수동확인` `/주문취소` `/키추가` `/재고` `/서포터목록`",
+                inline=False
+            )
+        if db.is_admin(uid) or not db.get_admins():
+            embed.add_field(
+                name="👑 관리자 명령어",
+                value="`/자판기설정` `/자판기새로고침` `/포인트지급` `/포인트차감` `/전체포인트지급` "
+                      "`/전체포인트차감` `/잔액확인` `/상품추가` `/상품삭제` `/쿠폰생성` `/쿠폰목록` "
+                      "`/쿠폰삭제` `/공지` `/관리자추가` `/설정확인` `/서포터추가` `/서포터제거` "
+                      "`/상품이모지` `/자판기이모지` `/자판기제목` `/자판기설명` `/자판기푸터` `/자판기색상`",
+                inline=False
+            )
+        embed.set_footer(text="문의는 자판기의 문의 버튼을 이용해주세요!")
         await interaction.response.send_message(embed=embed, ephemeral=True)

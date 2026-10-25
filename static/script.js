@@ -36,6 +36,7 @@ document.querySelectorAll('.sidebar nav a').forEach(link => {
         if (tab === 'stocklog') loadStockLogs();
         if (tab === 'auditlog') loadAuditLogs();
         if (tab === 'admins') loadAdmins();
+        if (tab === 'staff') loadStaff();
         if (tab === 'depositlog') loadWebhookLogs();
     });
 });
@@ -239,8 +240,15 @@ function openProductModal() {
     document.getElementById('product-price').value = '';
     document.getElementById('product-desc').value = '';
     document.getElementById('product-category').value = '';
+    const emojiEl = document.getElementById('product-emoji');
+    if (emojiEl) emojiEl.value = '';
     document.getElementById('product-active').value = '1';
     openModal('product-modal');
+}
+
+function setProductEmoji(emoji) {
+    const emojiEl = document.getElementById('product-emoji');
+    if (emojiEl) emojiEl.value = emoji;
 }
 
 function editProduct(id) {
@@ -253,6 +261,8 @@ function editProduct(id) {
         document.getElementById('product-price').value = p.price;
         document.getElementById('product-desc').value = p.description;
         document.getElementById('product-category').value = p.category || '';
+        const emojiEl = document.getElementById('product-emoji');
+        if (emojiEl) emojiEl.value = p.emoji || '';
         document.getElementById('product-active').value = p.active;
         openModal('product-modal');
     });
@@ -260,11 +270,13 @@ function editProduct(id) {
 
 async function saveProduct() {
     const id = document.getElementById('product-id').value;
+    const emojiEl = document.getElementById('product-emoji');
     const data = {
         name: document.getElementById('product-name').value,
         price: parseInt(document.getElementById('product-price').value),
         description: document.getElementById('product-desc').value,
         category: document.getElementById('product-category').value,
+        emoji: emojiEl ? emojiEl.value.trim() : '',
         active: parseInt(document.getElementById('product-active').value)
     };
     
@@ -317,6 +329,14 @@ async function deleteProduct(id) {
 function openKeyModal() {
     document.getElementById('key-values').value = '';
     openModal('key-modal');
+}
+
+function openKeyModalFor(productId) {
+    openKeyModal();
+    const select = document.getElementById('key-product');
+    if (select) select.value = String(productId);
+    const textarea = document.getElementById('key-values');
+    if (textarea) textarea.focus();
 }
 
 async function saveKeys() {
@@ -412,6 +432,12 @@ async function saveSettings() {
         use_categories: document.getElementById('set-use-categories').value
     };
     
+    // 자판기 이모지 / 출석 포인트
+    const vendingEmojiEl = document.getElementById('set-vending-emoji');
+    if (vendingEmojiEl) data.vending_emoji = vendingEmojiEl.value;
+    const attendancePointsEl = document.getElementById('set-attendance-points');
+    if (attendancePointsEl) data.attendance_points = attendancePointsEl.value;
+
     // 충전 요청 유효 시간 (자동입금 확인)
     const expireEl = document.getElementById('set-charge-expire');
     if (expireEl) data.charge_expire_minutes = expireEl.value;
@@ -799,6 +825,88 @@ async function removeAdmin(userId) {
         }
     } catch (e) {
         showToast('관리자 제거 실패', 'error');
+    }
+}
+
+// ============ STAFF (서포터 / 매니저) ============
+async function loadStaff() {
+    const container = document.getElementById('staff-container');
+    if (!container) return;
+    try {
+        const resp = await fetch('/api/staff');
+        const staff = await resp.json();
+
+        if (!staff.length) {
+            container.innerHTML = '<p style="color:#888;text-align:center;padding:20px;">등록된 서포터가 없습니다.</p>';
+            return;
+        }
+
+        let html = '<table><thead><tr><th>유저 ID</th><th>이름</th><th>권한</th><th>지정자</th><th>지정일</th><th>작업</th></tr></thead><tbody>';
+        staff.forEach(function(s) {
+            const isManager = s.role === 'manager';
+            const badge = isManager
+                ? '<span class="badge badge-completed">🛡️ 매니저</span>'
+                : '<span class="badge badge-pending">👤 서포터</span>';
+            html += '<tr>';
+            html += '<td>' + escapeHtml(s.user_id) + '</td>';
+            html += '<td>' + escapeHtml(s.username || '-') + '</td>';
+            html += '<td>' + badge + '</td>';
+            html += '<td>' + escapeHtml(s.added_by || '-') + '</td>';
+            html += '<td>' + escapeHtml(s.created_at || '-') + '</td>';
+            html += '<td><button class="btn btn-danger btn-sm" onclick="removeStaff(\'' + escapeHtml(s.user_id) + '\')"><i class="fas fa-trash"></i> 해제</button></td>';
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color:#e74c3c;text-align:center;padding:20px;">서포터 목록을 불러오는데 실패했습니다.</p>';
+    }
+}
+
+async function addStaff() {
+    const userId = document.getElementById('new-staff-id').value.trim();
+    const username = document.getElementById('new-staff-name').value.trim();
+    const roleEl = document.getElementById('new-staff-role');
+    const role = roleEl ? roleEl.value : 'supporter';
+
+    if (!userId) {
+        showToast('유저 ID를 입력해주세요.', 'error');
+        return;
+    }
+
+    try {
+        const resp = await fetch('/api/staff', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ user_id: userId, username: username, role: role })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            showToast(data.created ? '서포터가 지정되었습니다.' : '서포터 권한이 변경되었습니다.', 'success');
+            document.getElementById('new-staff-id').value = '';
+            document.getElementById('new-staff-name').value = '';
+            loadStaff();
+        } else {
+            showToast(data.error || '서포터 지정 실패', 'error');
+        }
+    } catch (e) {
+        showToast('서포터 지정 실패', 'error');
+    }
+}
+
+async function removeStaff(userId) {
+    if (!confirm('서포터 권한을 해제하시겠습니까?')) return;
+    try {
+        const resp = await fetch('/api/staff/' + userId, { method: 'DELETE' });
+        const data = await resp.json();
+        if (data.success) {
+            showToast('서포터 권한이 해제되었습니다.', 'success');
+            loadStaff();
+        } else {
+            showToast(data.error || '서포터 해제 실패', 'error');
+        }
+    } catch (e) {
+        showToast('서포터 해제 실패', 'error');
     }
 }
 

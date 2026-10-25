@@ -562,6 +562,11 @@ def dashboard():
     sale_summary = db.sale_summary()
     stock_logs = db.get_stock_logs(20)
     audit_logs = db.get_audit_logs(20)
+    # 운영 현황 (서포터 목록 / 유저 수 / 재고 부족 / 판매 TOP5)
+    staff_list = db.get_staff_list()
+    total_users = db.count_users()
+    low_stock = db.get_low_stock_products_live(3)
+    product_sales = db.get_product_sales_summary(5)
 
     return render_template('dashboard.html',
         stats=stats,
@@ -577,7 +582,11 @@ def dashboard():
         sale=sale,
         sale_summary=sale_summary,
         stock_logs=stock_logs,
-        audit_logs=audit_logs
+        audit_logs=audit_logs,
+        staff_list=staff_list,
+        total_users=total_users,
+        low_stock=low_stock,
+        product_sales=product_sales
     )
 
 # ============ API ROUTES ============
@@ -654,7 +663,8 @@ def api_add_product():
     category = data.get('category', '').strip()
     if not name or price <= 0:
         return jsonify({'error': '상품명과 가격을 확인해주세요.'}), 400
-    pid = db.add_product(name, price, description, category=category)
+    pid = db.add_product(name, price, description, category=category,
+                         emoji=str(data.get('emoji', '') or '').strip())
     db.add_audit_log('product_add', '', _admin_actor(),
                      f"{name} / {int(price):,}원 / 카테고리: {category or '없음'}")
     _schedule_vending_refresh(force=True)
@@ -670,7 +680,8 @@ def api_update_product(pid):
         price=data.get('price'),
         description=data.get('description'),
         active=data.get('active'),
-        category=data.get('category', '')
+        category=data.get('category', ''),
+        emoji=data.get('emoji')
     )
     db.add_audit_log('product_update', '', _admin_actor(),
                      f"ID {pid} / {data.get('name', '')} / {data.get('price', '')}원")
@@ -835,6 +846,43 @@ def api_add_admin():
 @login_required
 def api_remove_admin(user_id):
     db.remove_admin(user_id)
+    return jsonify({'success': True})
+
+# --- Staff (서포터 / 매니저) ---
+@app.route('/api/staff', methods=['GET'])
+@login_required
+def api_get_staff():
+    staff = db.get_staff_list()
+    for s in staff:
+        s['role_label'] = db.STAFF_ROLE_LABELS.get(s.get('role'), s.get('role'))
+    return jsonify(staff)
+
+@app.route('/api/staff', methods=['POST'])
+@login_required
+def api_add_staff():
+    data = request.json or {}
+    user_id = str(data.get('user_id', '')).strip()
+    username = str(data.get('username', '')).strip()
+    role = str(data.get('role', 'supporter')).strip().lower()
+    if not user_id:
+        return jsonify({'error': '유저 ID를 입력해주세요.'}), 400
+    if role not in db.STAFF_ROLES:
+        return jsonify({'error': '권한은 supporter 또는 manager 여야 합니다.'}), 400
+
+    created = db.add_staff(user_id, username or user_id, role, added_by=_admin_actor())
+    db.add_audit_log('staff_add', '', _admin_actor(),
+                     f"{username or user_id}({user_id}) → {db.STAFF_ROLE_LABELS.get(role, role)}")
+    return jsonify({'success': True, 'created': created})
+
+@app.route('/api/staff/<user_id>', methods=['DELETE'])
+@login_required
+def api_remove_staff(user_id):
+    staff = db.get_staff(user_id)
+    if not staff:
+        return jsonify({'error': '등록된 서포터가 아닙니다.'}), 404
+    db.remove_staff(user_id)
+    db.add_audit_log('staff_remove', '', _admin_actor(),
+                     f"{staff.get('username') or user_id}({user_id}) 해제")
     return jsonify({'success': True})
 
 # --- Users (Points) ---

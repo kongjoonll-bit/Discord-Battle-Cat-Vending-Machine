@@ -43,12 +43,19 @@ def init_db():
         stock INTEGER DEFAULT 0,
         active INTEGER DEFAULT 1,
         category TEXT DEFAULT '',
+        emoji TEXT DEFAULT '',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     
     # Add category column if not exists (migration for existing DBs)
     try:
         c.execute('ALTER TABLE products ADD COLUMN category TEXT DEFAULT \'\'')
+    except:
+        pass  # column already exists
+
+    # 자판기 이모지 컬럼 (상품별 아이콘)
+    try:
+        c.execute('ALTER TABLE products ADD COLUMN emoji TEXT DEFAULT \'\'')
     except:
         pass  # column already exists
     
@@ -89,6 +96,26 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS admins (
         user_id TEXT PRIMARY KEY,
         username TEXT NOT NULL
+    )''')
+
+    # Staff (서포터/매니저) table - 관리자보다 좁은 권한을 가진 운영 인원
+    c.execute('''CREATE TABLE IF NOT EXISTS staff (
+        user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        role TEXT DEFAULT 'supporter',  -- supporter = 서포터, manager = 매니저(관리자급)
+        added_by TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # 출석 체크 table - 하루 1회 (중복 방지를 UNIQUE 제약으로 보장)
+    c.execute('''CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        day TEXT NOT NULL,  -- KST 기준 YYYY-MM-DD
+        amount INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, day)
     )''')
     
     # Users table (for balance/points)
@@ -200,6 +227,7 @@ def init_db():
         'CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id)',
         'CREATE INDEX IF NOT EXISTS idx_charge_status ON charge_requests(status)',
         'CREATE INDEX IF NOT EXISTS idx_stock_logs_created ON stock_logs(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_attendance_user ON attendance(user_id)',
     ):
         try:
             c.execute(_sql)
@@ -236,11 +264,11 @@ def get_all_settings():
     return {row['key']: row['value'] for row in rows}
 
 # ============ PRODUCTS ============
-def add_product(name, price, description='', stock=0, category=''):
+def add_product(name, price, description='', stock=0, category='', emoji=''):
     conn = get_conn()
     c = conn.cursor()
-    c.execute('INSERT INTO products (name, price, description, stock, category) VALUES (?, ?, ?, ?, ?)',
-              (name, price, description, stock, category))
+    c.execute('INSERT INTO products (name, price, description, stock, category, emoji) VALUES (?, ?, ?, ?, ?, ?)',
+              (name, price, description, stock, category, emoji))
     conn.commit()
     pid = c.lastrowid
     conn.close()
@@ -286,7 +314,7 @@ def get_product(pid):
     conn.close()
     return dict(row) if row else None
 
-def update_product(pid, name=None, price=None, description=None, stock=None, active=None, category=None):
+def update_product(pid, name=None, price=None, description=None, stock=None, active=None, category=None, emoji=None):
     conn = get_conn()
     c = conn.cursor()
     product = get_product(pid)
@@ -299,8 +327,10 @@ def update_product(pid, name=None, price=None, description=None, stock=None, act
     if stock is not None: product['stock'] = stock
     if active is not None: product['active'] = active
     if category is not None: product['category'] = category
-    c.execute('UPDATE products SET name=?, price=?, description=?, stock=?, active=?, category=? WHERE id=?',
-              (product['name'], product['price'], product['description'], product['stock'], product['active'], product['category'], pid))
+    if emoji is not None: product['emoji'] = emoji
+    c.execute('UPDATE products SET name=?, price=?, description=?, stock=?, active=?, category=?, emoji=? WHERE id=?',
+              (product['name'], product['price'], product['description'], product['stock'],
+               product['active'], product['category'], product.get('emoji') or '', pid))
     conn.commit()
     conn.close()
     return True
@@ -1224,6 +1254,24 @@ def get_low_stock_products(threshold=3, active_only=True):
     return [dict(r) for r in rows]
 
 
+def get_low_stock_products_live(threshold=3, active_only=True):
+    """실제 미사용 키 개수(keys 테이블) 기준 재고 부족 상품
+
+    products.stock 컬럼은 수동 입력값이라 실제 판매 가능 수량과 다를 수 있어,
+    대시보드 알림에는 이 함수(실시간 계산)를 사용한다.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    where = 'WHERE p.active=1' if active_only else ''
+    c.execute(f'''SELECT p.*,
+                         (SELECT COUNT(*) FROM keys k WHERE k.product_id = p.id AND k.used = 0) AS live_stock
+                  FROM products p {where}
+                  ORDER BY live_stock ASC, p.id''')
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows if int(r['live_stock'] or 0) <= int(threshold)]
+
+
 # ============ AUDIT LOGS (관리자 행동 기록) ============
 def add_audit_log(action, actor_id='', actor_name='', detail=''):
     """관리자 행동(입고/할인/포인트 지급 등) 기록"""
@@ -1294,4 +1342,193 @@ def purge_old_data(days=90):
         conn.rollback()
     conn.close()
     return removed
+
+
+# ============ STAFF (서포터 / 매니저) ============
+STAFF_ROLES = ('supporter', 'manager')
+STAFF_ROLE_LABELS = {'supporter': '서포터', 'manager': '매니저'}
+
+
+def add_staff(user_id, username, role='supporter', added_by=''):
+    """서포터/매니저 등록 (이미 있으면 역할/이름 갱신)
+
+    Returns: True = 신규 등록, False = 기존 항목 갱신
+    """
+    role = (role or 'supporter').strip().lower()
+    if role not in STAFF_ROLES:
+        role = 'supporter'
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM staff WHERE user_id=?', (str(user_id),))
+    existing = c.fetchone()
+    if existing:
+        c.execute('UPDATE staff SET username=?, role=?, added_by=? WHERE user_id=?',
+                  (str(username or ''), role, str(added_by or ''), str(user_id)))
+    else:
+        c.execute('INSERT INTO staff (user_id, username, role, added_by) VALUES (?, ?, ?, ?)',
+                  (str(user_id), str(username or ''), role, str(added_by or '')))
+    conn.commit()
+    conn.close()
+    return existing is None
+
+
+def remove_staff(user_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('DELETE FROM staff WHERE user_id=?', (str(user_id),))
+    changed = c.rowcount or 0
+    conn.commit()
+    conn.close()
+    return changed > 0
+
+
+def get_staff(user_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT * FROM staff WHERE user_id=?', (str(user_id),))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_staff_list():
+    """서포터 목록 (매니저 먼저, 그다음 등록순)"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM staff ORDER BY CASE role WHEN 'manager' THEN 0 ELSE 1 END, created_at, rowid")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def is_staff(user_id):
+    """서포터 또는 매니저 여부 (관리자는 별도)"""
+    return get_staff(user_id) is not None
+
+
+def staff_role(user_id):
+    row = get_staff(user_id)
+    return row['role'] if row else None
+
+
+def can_manage_orders(user_id):
+    """주문 확인/취소, 재고 확인 등 운영 권한 (관리자 + 서포터/매니저)"""
+    return bool(is_admin(user_id) or is_staff(user_id))
+
+
+# ============ ATTENDANCE (출석 체크) ============
+def _today_kst():
+    """KST(UTC+9) 기준 오늘 날짜 문자열"""
+    from datetime import timedelta
+    return (datetime.utcnow() + timedelta(hours=9)).strftime('%Y-%m-%d')
+
+
+def claim_attendance(user_id, username, amount=0, day=None):
+    """출석 체크 (하루 1회, 포인트 즉시 지급)
+
+    Returns: (success, total_days, amount)
+      - success=False 이면 이미 오늘 출석한 상태 (total_days = 누적 일수)
+    """
+    day = day or _today_kst()
+    amount = max(0, int(amount or 0))
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO attendance (user_id, username, day, amount) VALUES (?, ?, ?, ?)',
+                  (str(user_id), str(username or ''), day, amount))
+    except sqlite3.IntegrityError:
+        c.execute('SELECT COUNT(*) AS cnt FROM attendance WHERE user_id=?', (str(user_id),))
+        row = c.fetchone()
+        conn.close()
+        return False, (row['cnt'] if row else 0), 0
+
+    try:
+        c.execute('INSERT OR IGNORE INTO users (user_id, username, balance) VALUES (?, ?, 0)',
+                  (str(user_id), str(username or '')))
+        c.execute('UPDATE users SET username=?, balance = balance + ? WHERE user_id=?',
+                  (str(username or ''), amount, str(user_id)))
+        if amount:
+            c.execute('''INSERT INTO transactions (user_id, amount, type, description)
+                         VALUES (?, ?, 'attendance', ?)''',
+                      (str(user_id), amount, f'출석 체크 보상 ({day})'))
+        conn.commit()
+        c.execute('SELECT COUNT(*) AS cnt FROM attendance WHERE user_id=?', (str(user_id),))
+        row = c.fetchone()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return True, (row['cnt'] if row else 1), amount
+
+
+def attendance_today(user_id, day=None):
+    """오늘 출석 여부"""
+    day = day or _today_kst()
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM attendance WHERE user_id=? AND day=?', (str(user_id), day))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
+def count_attendance(user_id):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) AS cnt FROM attendance WHERE user_id=?', (str(user_id),))
+    row = c.fetchone()
+    conn.close()
+    return row['cnt'] if row else 0
+
+
+def get_attendance_top(limit=10):
+    """출석 일수 랭킹"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT user_id, MAX(username) AS username, COUNT(*) AS days
+                 FROM attendance GROUP BY user_id
+                 ORDER BY days DESC, MAX(id) ASC LIMIT ?''', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ============ RANKING / 통계 ============
+def get_top_balances(limit=10):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT ?', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_top_buyers(limit=10):
+    """누적 구매 금액 기준 상위 유저"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT user_id, MAX(username) AS username,
+                        COUNT(*) AS orders, COALESCE(SUM(amount), 0) AS total
+                 FROM orders
+                 WHERE status IN ('completed', 'confirmed')
+                 GROUP BY user_id
+                 ORDER BY total DESC, orders DESC LIMIT ?''', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_product_sales_summary(limit=10):
+    """상품별 판매 수량/매출 요약"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT product_name, COUNT(*) AS orders, COALESCE(SUM(amount), 0) AS total
+                 FROM orders
+                 WHERE status IN ('completed', 'confirmed')
+                 GROUP BY product_name
+                 ORDER BY orders DESC LIMIT ?''', (int(limit),))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 

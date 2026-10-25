@@ -471,6 +471,7 @@
             <a href="#" data-tab="auditlog"><i class="fas fa-clipboard-list"></i><span>감사 로그</span></a>
             <a href="#" data-tab="depositlog"><i class="fas fa-history"></i><span>입금 로그</span></a>
             <a href="#" data-tab="settings"><i class="fas fa-cog"></i><span>설정</span></a>
+            <a href="#" data-tab="staff"><i class="fas fa-user-tie"></i><span>서포터 관리</span></a>
             <a href="#" data-tab="admins"><i class="fas fa-user-shield"></i><span>관리자</span></a>
         </nav>
         <div class="logout">
@@ -512,7 +513,57 @@
                     <div class="value">{{ products|length }}</div>
                     <div class="label">등록된 상품</div>
                 </div>
+                <div class="stat-card">
+                    <div class="icon">👥</div>
+                    <div class="value">{{ total_users }}</div>
+                    <div class="label">등록 유저</div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon">⚠️</div>
+                    <div class="value">{{ low_stock|length }}</div>
+                    <div class="label">재고 부족 상품</div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon">👤</div>
+                    <div class="value">{{ staff_list|length }}</div>
+                    <div class="label">서포터 / 매니저</div>
+                </div>
             </div>
+
+            {% if low_stock or product_sales %}
+            <div class="card">
+                <h3><i class="fas fa-chart-line"></i> 운영 인사이트</h3>
+                {% if low_stock %}
+                <div style="margin-bottom:18px;">
+                    <b style="color:#e74c3c;">⚠️ 재고 부족 (3개 이하)</b>
+                    <ul style="margin:8px 0 0 18px;line-height:1.8;">
+                        {% for p in low_stock %}
+                        <li>{{ p.emoji or '📦' }} <b>{{ p.name }}</b> — 남은 재고 <b style="color:#e74c3c;">{{ p.live_stock }}개</b>
+                            <button class="btn btn-success btn-sm" onclick="openKeyModalFor({{ p.id }})">키 추가</button>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+                {% if product_sales %}
+                <div>
+                    <b>🏆 판매 TOP {{ product_sales|length }}</b>
+                    <table style="margin-top:8px;">
+                        <thead><tr><th>상품</th><th>판매 수량</th><th>매출</th></tr></thead>
+                        <tbody>
+                            {% for s in product_sales %}
+                            <tr>
+                                <td>{{ s.product_name }}</td>
+                                <td>{{ s.orders }}건</td>
+                                <td>{{ '{:,}'.format(s.total) }}원</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
             
             <div class="card">
                 <h3><i class="fas fa-clock"></i> 대기 중인 주문</h3>
@@ -628,6 +679,7 @@
                         <thead>
                             <tr>
                                 <th>ID</th>
+                                <th>이모지</th>
                                 <th>상품명</th>
                                 <th>가격</th>
                                 <th>설명</th>
@@ -640,6 +692,7 @@
                             {% for p in products %}
                             <tr>
                                 <td>{{ p.id }}</td>
+                                <td style="font-size:20px;text-align:center;">{{ p.emoji or '📦' }}</td>
                                 <td>{{ p.name }}</td>
                                 <td>{{ '{:,}'.format(p.price) }}원</td>
                                 <td>{{ p.description }}</td>
@@ -973,6 +1026,16 @@
                     <input type="text" id="set-review-channel" value="{{ settings.get('review_channel_id', '') }}" placeholder="후기가 등록될 Discord 채널 ID">
                 </div>
                 <div class="form-group">
+                    <label>자판기 제목 이모지</label>
+                    <input type="text" id="set-vending-emoji" value="{{ settings.get('vending_emoji', '🐱') }}" placeholder="🐱 / :cat: / <:cat:123456789012345678>">
+                    <small style="opacity:.7;display:block;margin-top:4px;">자판기 제목 앞에 표시됩니다. 비우면 이모지 없이 표시됩니다.</small>
+                </div>
+                <div class="form-group">
+                    <label>출석 체크 포인트</label>
+                    <input type="number" id="set-attendance-points" min="0" max="100000" value="{{ settings.get('attendance_points', '100') }}">
+                    <small style="opacity:.7;display:block;margin-top:4px;">하루 1회 <b>/출석</b> 시 지급되는 포인트입니다. (0이면 지급 없음)</small>
+                </div>
+                <div class="form-group">
                     <label>카테고리 사용</label>
                     <select id="set-use-categories">
                         <option value="true" {{ 'selected' if settings.get('use_categories', 'false') == 'true' else '' }}>사용</option>
@@ -1047,6 +1110,42 @@
             </div>
         </div>
         
+        <!-- Staff Tab -->
+        <div class="tab-content" id="tab-staff">
+            <div class="card">
+                <h3><i class="fas fa-user-tie"></i> 서포터 / 매니저 목록</h3>
+                <div id="staff-container"></div>
+                <small style="opacity:.7;display:block;margin-top:10px;">
+                    👤 <b>서포터</b>는 주문 확인/취소, 재고 조회, 키 추가만 가능하고
+                    🛡️ <b>매니저</b>는 관리자급 운영이 가능합니다. (설정/포인트 지급은 관리자 전용)
+                </small>
+            </div>
+            <div class="card">
+                <h3><i class="fas fa-user-plus"></i> 서포터 지정</h3>
+                <div class="form-group">
+                    <label>Discord 유저 ID</label>
+                    <input type="text" id="new-staff-id" placeholder="Discord 유저 ID (숫자)">
+                </div>
+                <div class="form-group">
+                    <label>유저 이름</label>
+                    <input type="text" id="new-staff-name" placeholder="유저 이름 (닉네임)">
+                </div>
+                <div class="form-group">
+                    <label>권한</label>
+                    <select id="new-staff-role">
+                        <option value="supporter">👤 서포터 — 주문 확인/취소, 재고 조회, 키 추가</option>
+                        <option value="manager">🛡️ 매니저 — 관리자급 운영</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" onclick="addStaff()">
+                    <i class="fas fa-plus"></i> 서포터 지정
+                </button>
+                <small style="opacity:.7;display:block;margin-top:10px;">
+                    💡 같은 유저를 다시 지정하면 권한이 변경됩니다. Discord에서도 <code>/서포터추가</code> 로 지정할 수 있습니다.
+                </small>
+            </div>
+        </div>
+
         <!-- Admins Tab -->
         <div class="tab-content" id="tab-admins">
             <div class="card">
@@ -1090,6 +1189,23 @@
             <div class="form-group">
                 <label>카테고리</label>
                 <input type="text" id="product-category" placeholder="카테고리 (예: 통조림, 티켓, XP)">
+            </div>
+            <div class="form-group">
+                <label>자판기 이모지</label>
+                <input type="text" id="product-emoji" placeholder="🎁 / :cat: / <:cat:123456789012345678> / 이모지ID">
+                <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('🎁')">🎁</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('🍖')">🍖</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('🐟')">🐟</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('🥫')">🥫</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('💎')">💎</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('🔥')">🔥</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('⭐')">⭐</button>
+                    <button type="button" class="btn btn-info btn-sm" style="background:#6c757d;" onclick="setProductEmoji('')">기본</button>
+                </div>
+                <small style="opacity:.7;display:block;margin-top:4px;">
+                    비워두면 기본 📦 이 표시됩니다. 서버 커스텀 이모지는 <code>:이름:</code> 형식으로 입력하세요.
+                </small>
             </div>
             <div class="form-group">
                 <label>판매 상태</label>
