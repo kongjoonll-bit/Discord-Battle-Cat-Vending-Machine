@@ -236,6 +236,54 @@ def _classify_login_error(err):
     return 'other'
 
 
+def _retry_after_hint(err):
+    """429 응답이 알려준 Retry-After(초) 추출 - 없으면 0.0
+
+    디스코드는 레이트리밋 시 JSON 본문(`retry_after`) 또는 `Retry-After` 헤더로
+    대기 시간을 알려준다. 이 값을 무시하고 짧게 재시도하면 차단이 연장되므로
+    가능한 한 존중한다.
+    """
+    found = []
+    try:
+        ra = getattr(err, 'retry_after', None)
+        if ra is not None:
+            found.append(float(ra))
+    except (TypeError, ValueError):
+        pass
+    try:
+        resp = getattr(err, 'response', None)
+        if resp is not None:
+            hdr = resp.headers.get('Retry-After')
+            if hdr is not None:
+                found.append(float(hdr))
+    except Exception:
+        pass
+    m = re.search(r'retry_after[^\d]{0,6}([\d.]+)', str(err or ''), re.I)
+    if m:
+        try:
+            found.append(float(m.group(1)))
+        except ValueError:
+            pass
+    positive = [v for v in found if v is not None and v >= 0]
+    return max(positive) if positive else 0.0
+
+
+def _error_brief(err, token='', limit=180):
+    """로그용 오류 요약 - 토큰 마스킹 + 응답 종류(Cloudflare/HTML) 태그"""
+    text = str(err or '')
+    if token:
+        text = text.replace(token, '***')
+    text = ' '.join(text.split())
+    low = text.lower()
+    if '1015' in low or 'cloudflare' in low or 'access denied' in low:
+        tag = '[cloudflare] '
+    elif '<html' in low or '<!doctype' in low:
+        tag = '[html] '
+    else:
+        tag = ''
+    return tag + text[:limit]
+
+
 def _login_retry_delay(kind, attempt):
     """로그인 재시도 대기 시간(초) - 지수 백오프 + 지터
 
@@ -249,7 +297,9 @@ def _login_retry_delay(kind, attempt):
     except (TypeError, ValueError):
         cap = 900.0
     cap = max(30.0, min(cap, 3600.0))
-    base = 60.0 if kind == 'cloudflare_ban' else 15.0
+    # 429(레이트리밋)도 첫 대기부터 60초. 15초 같은 짧은 재시도는 오히려
+    # Cloudflare 1015(장기 차단)로 escalate 되기 쉽다.
+    base = 60.0 if kind in ('cloudflare_ban', 'rate_limit') else 15.0
     delay = min(base * (2 ** min(max(attempt - 1, 0), 4)), cap)
     return delay * random.uniform(0.9, 1.1)
 
@@ -965,6 +1015,11 @@ class VendingBot(commands.Bot):
                 except Exception as e:
                     kind = _classify_login_error(e)
                     delay = _login_retry_delay(kind, attempt)
+                    # 429/차단 응답이 알려준 Retry-After를 존중 (짧은 재시도 = 차단 연장)
+                    if kind in ('rate_limit', 'cloudflare_ban'):
+                        hint = _retry_after_hint(e)
+                        if hint > 0:
+                            delay = max(delay, min(hint + 1.0, 900.0))
                     # 진단용 상태 기록 (토큰 원문이 메시지에 섞여도 마스킹)
                     try:
                         err_text = str(e)
@@ -991,9 +1046,15 @@ class VendingBot(commands.Bot):
                             f"{delay:.0f}초 후 재시도합니다 (시도 #{attempt}). "
                             "코드 문제가 아니며, 보통 수 분~수십 분 내 자동 해제됩니다." + hint)
                     elif kind == 'rate_limit':
+                        hint = (" Render 무료 플랜은 아웃바운드 IP를 공유해서, 같은 대역을 쓰는 다른 서비스 때문에 "
+                                "로그인 엔드포인트가 429가 되곤 합니다. 반복 재시도는 차단을 연장하니 "
+                                "PC에서 직접 실행하거나 고정 IP(VPS/Oracle 무료)/DISCORD_PROXY를 권장합니다."
+                                if not instance.proxy_label else
+                                " 프록시 IP까지 레이트리밋 중입니다. 잠시 대기하거나 다른 프록시를 쓰세요.")
                         logger.warning(
                             f"[BOT] 로그인 429(레이트리밋) - {delay:.0f}초 후 재시도합니다 "
-                            f"(시도 #{attempt})")
+                            f"(시도 #{attempt}) | 응답: {_error_brief(e, token)}"
+                            + (hint if attempt >= 3 else ""))
                     else:
                         logger.error(
                             f"[BOT] 봇 실행 오류: {e!r} - {delay:.0f}초 후 재시도합니다 "
